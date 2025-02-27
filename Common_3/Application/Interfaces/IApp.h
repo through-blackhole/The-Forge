@@ -226,7 +226,7 @@ FORGE_API extern int WindowsMain(int argc, char** argv, IApp* app);
     extern "C"                                                                               \
     {                                                                                        \
         __declspec(dllexport) extern const UINT D3D12SDKVersion = D3D12_AGILITY_SDK_VERSION; \
-        __declspec(dllexport) extern const char* D3D12SDKPath = u8"";                        \
+        __declspec(dllexport) extern const char* D3D12SDKPath = "./D3D12/";                  \
     }                                                                                        \
                                                                                              \
     int main(int argc, char** argv)                                                          \

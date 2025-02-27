@@ -29185,7 +29185,7 @@ void flecs_name_index_ensure(
     }
 
     flecs_hashmap_result_t hmr = flecs_hashmap_ensure_(map, 
-        ECS_SIZEOF(key), ECS_ALIGNOF(key), &key, ECS_SIZEOF(uint64_t), ECS_ALIGNOF(uint64_t));
+        ECS_SIZEOF(key), ECS_ALIGNOF(ecs_hashed_string_t), &key, ECS_SIZEOF(uint64_t), ECS_ALIGNOF(uint64_t));
     *((uint64_t*)hmr.value) = id;
 }
 

@@ -238,8 +238,9 @@ COMPILE_ASSERT(sizeof(ssize_t) == sizeof(int64_t));
 // Whitelist of compiler versions
 #if (_MSC_VER == 1929) // VS 2019 all VC++ compilers
 #else
-#pragma message("Bad Visual Studio version: (" QUOTE(_MSC_VER) " " QUOTE(_MSC_FULL_VER) " " QUOTE(_MSC_BUILD) ").")
-#error "Bad Visual Studio version"
+// we are going to use clang-cl
+// #pragma message("Bad Visual Studio version: (" QUOTE(_MSC_VER) " " QUOTE(_MSC_FULL_VER) " " QUOTE(_MSC_BUILD) ").")
+// #error "Bad Visual Studio version"
 #endif
 
 #endif
@@ -411,6 +412,7 @@ COMPILE_ASSERT(sizeof(ssize_t) == sizeof(int64_t));
 #endif
 
 #if defined(_DEBUG) && defined(NDEBUG)
-#error "_DEBUG and NDEBUG are defined at the same time"
+#undef _DEBUG
+// #error "_DEBUG and NDEBUG are defined at the same time"
 #endif
 #endif
