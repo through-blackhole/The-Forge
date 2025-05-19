@@ -48,11 +48,11 @@
 // Small primitive culling now supports MSAA
 // Multi-viewport culling
 
-#include "Shader_Defs.h.fsl"
+#include "ShaderDefs.h.fsl"
 
-#include "vb_resources.h.fsl"
-#include "triangleFiltering.srt.h"
-#include "../../../../../../Common_3/Renderer/VisibilityBuffer/Shaders/FSL/triangle_filtering.h.fsl"
+#include "VisibilityBufferResources.h.fsl"
+#include "TriangleFiltering.srt.h"
+#include "../../../../../../Common_3/Renderer/VisibilityBuffer/Shaders/FSL/TriangleFiltering.h.fsl"
 
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(VB_COMPUTE_THREADS, 1, 1)
@@ -106,7 +106,11 @@ void CS_MAIN( SV_GroupThreadID(uint3) inGroupId, SV_GroupID(uint3) groupId )
 
 		for (uint i = 0; i < gPerFrameVBConstants.numViewports; ++i)
 		{
+#if defined(TARGET_QUEST)
+			float4x4 worldViewProjection = gPerFrameVBConstants.cullingMVP[i];
+#else
 			float4x4 worldViewProjection = gPerFrameVBConstants.transform[i].mvp.mat;
+#endif
 			float4 vertices[3] =
 			{
 				mul(worldViewProjection, vert[0]),

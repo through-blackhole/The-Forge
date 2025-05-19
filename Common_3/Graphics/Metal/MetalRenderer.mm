@@ -306,17 +306,20 @@ void                       util_update_gpu_to_cpu_timestamp_factor(Renderer* pRe
 // GPU frame time accessor for macOS and iOS
 #define GPU_FREQUENCY 1000000000.0 // nanoseconds
 
-void getBufferSizeAlign(Renderer* pRenderer, const BufferDesc* pDesc, ResourceSizeAlign* pOut);
-void getTextureSizeAlign(Renderer* pRenderer, const TextureDesc* pDesc, ResourceSizeAlign* pOut);
-void addBuffer(Renderer* pRenderer, const BufferDesc* pDesc, Buffer** pp_buffer);
-void removeBuffer(Renderer* pRenderer, Buffer* pBuffer);
-void mapBuffer(Renderer* pRenderer, Buffer* pBuffer, ReadRange* pRange);
-void unmapBuffer(Renderer* pRenderer, Buffer* pBuffer);
-void cmdUpdateBuffer(Cmd* pCmd, Buffer* pBuffer, uint64_t dstOffset, Buffer* pSrcBuffer, uint64_t srcOffset, uint64_t size);
-void cmdUpdateSubresource(Cmd* pCmd, Texture* pTexture, Buffer* pSrcBuffer, const struct SubresourceDataDesc* pSubresourceDesc);
-void cmdCopySubresource(Cmd* pCmd, Buffer* pDstBuffer, Texture* pTexture, const struct SubresourceDataDesc* pSubresourceDesc);
-void addTexture(Renderer* pRenderer, const TextureDesc* pDesc, Texture** ppTexture);
-void removeTexture(Renderer* pRenderer, Texture* pTexture);
+extern "C"
+{
+    void getBufferSizeAlign(Renderer* pRenderer, const BufferDesc* pDesc, ResourceSizeAlign* pOut);
+    void getTextureSizeAlign(Renderer* pRenderer, const TextureDesc* pDesc, ResourceSizeAlign* pOut);
+    void addBuffer(Renderer* pRenderer, const BufferDesc* pDesc, Buffer** pp_buffer);
+    void removeBuffer(Renderer* pRenderer, Buffer* pBuffer);
+    void mapBuffer(Renderer* pRenderer, Buffer* pBuffer, ReadRange* pRange);
+    void unmapBuffer(Renderer* pRenderer, Buffer* pBuffer);
+    void cmdUpdateBuffer(Cmd* pCmd, Buffer* pBuffer, uint64_t dstOffset, Buffer* pSrcBuffer, uint64_t srcOffset, uint64_t size);
+    void cmdUpdateSubresource(Cmd* pCmd, Texture* pTexture, Buffer* pSrcBuffer, const struct SubresourceDataDesc* pSubresourceDesc);
+    void cmdCopySubresource(Cmd* pCmd, Buffer* pDstBuffer, Texture* pTexture, const struct SubresourceDataDesc* pSubresourceDesc);
+    void addTexture(Renderer* pRenderer, const TextureDesc* pDesc, Texture** ppTexture);
+    void removeTexture(Renderer* pRenderer, Texture* pTexture);
+}
 
 /************************************************************************/
 // Globals
@@ -1167,7 +1170,7 @@ void updateDescriptorSet(Renderer* pRenderer, uint32_t index, DescriptorSet* pDe
                             [pDescriptorSet->mArgumentEncoder setTexture:texture->pUAVDescriptors[pParam->mUAVMipSlice]
                                                                  atIndex:bindIndex + arrayStart + j];
                             MTLResourceUsage usage = MTLResourceUsageRead | MTLResourceUsageWrite;
-                            TrackUntrackedResource(pDescriptorSet, index, usage, texture->pUAVDescriptors[j]);
+                            TrackUntrackedResource(pDescriptorSet, index, usage, texture->pUAVDescriptors[pParam->mUAVMipSlice]);
                         }
                     }
                 }
@@ -2243,6 +2246,13 @@ static void QueryGpuDesc(GpuDesc* pGpuDesc)
         pGpuDesc->mDrawBoundarySamplingSupported =
             pGpuDesc->pCounterSetTimestamp && [gpu supportsCounterSampling:MTLCounterSamplingPointAtDrawBoundary];
     }
+
+#ifdef TARGET_IOS
+    pGpuDesc->mUnifiedMemorySupport = [gpu hasUnifiedMemory] ? UMA_SUPPORT_READ_WRITE : UMA_SUPPORT_NONE;
+#else
+    // (m1,m2 are known to have problems with shared UAV resources )
+    pGpuDesc->mUnifiedMemorySupport = [gpu hasUnifiedMemory] ? UMA_SUPPORT_READ : UMA_SUPPORT_NONE;
+#endif
 }
 
 static bool SelectBestGpu(const RendererDesc* settings, Renderer* pRenderer)
@@ -2284,6 +2294,14 @@ static bool SelectBestGpu(const RendererDesc* settings, Renderer* pRenderer)
     //}
 
     ASSERT(gpuIndex < pContext->mGpuCount);
+
+    bool gpuSupported = util_check_is_gpu_supported(&gpuDesc[gpuIndex]);
+    if (!gpuSupported)
+    {
+        LOGF(eERROR, "Failed to Init Renderer: %s", getUnsupportedGPUMsg());
+        return false;
+    }
+
     pRenderer->pDevice = gpus[gpuIndex].pGPU;
     pRenderer->pGpu = &gpus[gpuIndex];
     pRenderer->mLinkedNodeCount = 1;
@@ -2376,7 +2394,15 @@ void initRenderer(const char* appName, const RendererDesc* settings, Renderer** 
 
     // Initialize the Metal bits
     {
-        SelectBestGpu(settings, pRenderer);
+        if (!SelectBestGpu(settings, pRenderer))
+        {
+            // set device to null
+            pRenderer->pDevice = nil;
+            // remove allocated renderer
+            SAFE_FREE(pRenderer);
+            *ppRenderer = NULL;
+            return;
+        }
 
         LOGF(LogLevel::eINFO, "Metal: Heaps: %s", pRenderer->pGpu->mHeaps ? "true" : "false");
         LOGF(LogLevel::eINFO, "Metal: Placement Heaps: %s", pRenderer->pGpu->mPlacementHeaps ? "true" : "false");
@@ -2822,8 +2848,20 @@ void addResourceHeap(Renderer* pRenderer, const ResourceHeapDesc* pDesc, Resourc
         return;
     }
 
+    const bool isUma =
+        pRenderer->pGpu->mUnifiedMemorySupport != UMA_SUPPORT_NONE &&
+        (pRenderer->pGpu->mUnifiedMemorySupport == UMA_SUPPORT_READ_WRITE || (pDesc->mDescriptors & DESCRIPTOR_TYPE_RW_MASK) == 0);
+
+    // Same reasoning as addBuffer. Forced to always create MTLStorageMode_Shared heap here.
     VmaAllocationCreateInfo vma_mem_reqs = {};
-    vma_mem_reqs.usage = (VmaMemoryUsage)pDesc->mMemoryUsage;
+    if (isUma && pDesc->mMemoryUsage == RESOURCE_MEMORY_USAGE_GPU_ONLY)
+    {
+        vma_mem_reqs.usage = (VmaMemoryUsage)RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+    }
+    else
+    {
+        vma_mem_reqs.usage = (VmaMemoryUsage)pDesc->mMemoryUsage;
+    }
     vma_mem_reqs.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
 
     VkMemoryRequirements vkMemReq = {};
@@ -2918,8 +2956,23 @@ void addBuffer(Renderer* pRenderer, const BufferDesc* pDesc, Buffer** ppBuffer)
     Buffer* pBuffer = (Buffer*)tf_calloc_memalign(1, alignof(Buffer), sizeof(Buffer));
     ASSERT(pBuffer);
 
-    uint64_t           allocationSize = pDesc->mSize;
-    const MemoryType   memoryType = util_to_memory_type(pDesc->mMemoryUsage);
+    uint64_t   allocationSize = pDesc->mSize;
+    MemoryType memoryType;
+
+    const bool isUma =
+        pRenderer->pGpu->mUnifiedMemorySupport != UMA_SUPPORT_NONE &&
+        (pRenderer->pGpu->mUnifiedMemorySupport == UMA_SUPPORT_READ_WRITE || (pDesc->mDescriptors & DESCRIPTOR_TYPE_RW_MASK) == 0);
+
+    // Resource Loader assumes devices support uma will always update a buffer from the cpu side directly.
+    // Naively allocate MTLStorageMode_Shared since there is no way of knowing whether a buffer will be updated or not here.
+    if (isUma && pDesc->mMemoryUsage == RESOURCE_MEMORY_USAGE_GPU_ONLY)
+    {
+        memoryType = MEMORY_TYPE_CPU_TO_GPU;
+    }
+    else
+    {
+        memoryType = util_to_memory_type(pDesc->mMemoryUsage);
+    }
     MTLResourceOptions resourceOptions = gMemoryOptions[memoryType];
     // Align the buffer size to multiples of the dynamic uniform buffer minimum size
     if (pDesc->mDescriptors & DESCRIPTOR_TYPE_UNIFORM_BUFFER)
@@ -3237,14 +3290,10 @@ void addShaderBinary(Renderer* pRenderer, const BinaryShaderDesc* pDesc, Shader*
     ASSERT(pDesc && pDesc->mStages);
     ASSERT(ppShaderProgram);
 
-    Shader* pShaderProgram = (Shader*)tf_calloc(1, sizeof(Shader) + sizeof(PipelineReflection));
+    Shader* pShaderProgram = (Shader*)tf_calloc(1, sizeof(Shader));
     ASSERT(pShaderProgram);
 
     pShaderProgram->mStages = pDesc->mStages;
-    pShaderProgram->pReflection = (PipelineReflection*)(pShaderProgram + 1);
-
-    uint32_t         reflectionCount = 0;
-    ShaderReflection stageReflections[SHADER_STAGE_COUNT] = {};
 
     for (uint32_t i = 0; i < SHADER_STAGE_COUNT; ++i)
     {
@@ -3303,17 +3352,12 @@ void addShaderBinary(Renderer* pRenderer, const BinaryShaderDesc* pDesc, Shader*
 
             *compiled_code = function;
         }
-
-        reflectionCount++;
     }
-
-    addPipelineReflection(stageReflections, reflectionCount, pShaderProgram->pReflection);
 
     if (pShaderProgram->mStages & SHADER_STAGE_COMP)
     {
         for (size_t i = 0; i < 3; ++i)
         {
-            pShaderProgram->pReflection->mNumThreadsPerGroup[i] = pDesc->mComp.mNumThreadsPerGroup[i];
             pShaderProgram->mNumThreadsPerGroup[i] = pDesc->mComp.mNumThreadsPerGroup[i];
             // ASSERT(pShaderProgram->mNumThreadsPerGroup[i]);
         }
@@ -3322,11 +3366,6 @@ void addShaderBinary(Renderer* pRenderer, const BinaryShaderDesc* pDesc, Shader*
     if (pShaderProgram->pVertexShader)
     {
         pShaderProgram->mTessellation = pShaderProgram->pVertexShader.patchType != MTLPatchTypeNone;
-    }
-
-    for (uint32_t i = 0; i < pShaderProgram->pReflection->mStageReflectionCount; ++i)
-    {
-        removeShaderReflection(&stageReflections[i]);
     }
 
     *ppShaderProgram = pShaderProgram;
@@ -3339,8 +3378,6 @@ void removeShader(Renderer* pRenderer, Shader* pShaderProgram)
     pShaderProgram->pVertexShader = nil;
     pShaderProgram->pFragmentShader = nil;
     pShaderProgram->pComputeShader = nil;
-
-    removePipelineReflection(pShaderProgram->pReflection);
     SAFE_FREE(pShaderProgram);
 }
 void addGraphicsPipelineImpl(Renderer* pRenderer, const char* pName, const GraphicsPipelineDesc* pDesc, Pipeline** ppPipeline)
@@ -3468,11 +3505,15 @@ void addGraphicsPipelineImpl(Renderer* pRenderer, const char* pName, const Graph
     {
         // assign depth state
         pPipeline->pDepthStencilState = pDesc->pDepthState ? util_to_depth_state(pRenderer, pDesc->pDepthState) : pDefaultDepthState;
-
-        renderPipelineDesc.depthAttachmentPixelFormat = (MTLPixelFormat)TinyImageFormat_ToMTLPixelFormat(pDesc->mDepthStencilFormat);
-        if (pDesc->mDepthStencilFormat == TinyImageFormat_D24_UNORM_S8_UINT ||
-            pDesc->mDepthStencilFormat == TinyImageFormat_D32_SFLOAT_S8_UINT)
-            renderPipelineDesc.stencilAttachmentPixelFormat = renderPipelineDesc.depthAttachmentPixelFormat;
+        MTLPixelFormat depthStencilFormat = (MTLPixelFormat)TinyImageFormat_ToMTLPixelFormat(pDesc->mDepthStencilFormat);
+        if (TinyImageFormat_HasDepth(pDesc->mDepthStencilFormat))
+        {
+            renderPipelineDesc.depthAttachmentPixelFormat = depthStencilFormat;
+        }
+        if (TinyImageFormat_HasStencil(pDesc->mDepthStencilFormat))
+        {
+            renderPipelineDesc.stencilAttachmentPixelFormat = depthStencilFormat;
+        }
     }
 
     // assign common tesselation configuration if needed.
@@ -3704,7 +3745,7 @@ void cmdBindRenderTargets(Cmd* pCmd, const BindRenderTargetsDesc* pDesc)
         pCmd->mShouldRebindPipeline = 1;
     }
 
-    const bool hasDepth = pDesc->mDepthStencil.pDepthStencil;
+    const bool hasDepthStencil = pDesc->mDepthStencil.pDepthStencil;
 
     @autoreleasepool
     {
@@ -3783,26 +3824,28 @@ void cmdBindRenderTargets(Cmd* pCmd, const BindRenderTargetsDesc* pDesc)
             renderPassDesc.colorAttachments[i].clearColor = MTLClearColorMake(clearValue.r, clearValue.g, clearValue.b, clearValue.a);
         }
 
-        if (hasDepth)
+        if (hasDepthStencil)
         {
             const BindDepthTargetDesc* desc = &pDesc->mDepthStencil;
-            renderPassDesc.depthAttachment.texture = desc->pDepthStencil->pTexture->pTexture;
-            if (desc->mUseMipSlice)
+            TinyImageFormat            dsFormat =
+                TinyImageFormat_FromMTLPixelFormat((TinyImageFormat_MTLPixelFormat)desc->pDepthStencil->pTexture->pTexture.pixelFormat);
+            bool hasDepth = TinyImageFormat_HasDepth(dsFormat);
+            bool hasStencil = TinyImageFormat_HasStencil(dsFormat);
+
+            if (hasDepth)
             {
-                renderPassDesc.depthAttachment.level = desc->mMipSlice;
+                const BindDepthTargetDesc* desc = &pDesc->mDepthStencil;
+                renderPassDesc.depthAttachment.texture = desc->pDepthStencil->pTexture->pTexture;
+                if (desc->mUseMipSlice)
+                {
+                    renderPassDesc.depthAttachment.level = desc->mMipSlice;
+                }
+                if (desc->mUseArraySlice)
+                {
+                    renderPassDesc.depthAttachment.slice = desc->mArraySlice;
+                }
             }
-            if (desc->mUseArraySlice)
-            {
-                renderPassDesc.depthAttachment.slice = desc->mArraySlice;
-            }
-#ifndef TARGET_IOS
-            bool isStencilEnabled = desc->pDepthStencil->pTexture->pTexture.pixelFormat == MTLPixelFormatDepth24Unorm_Stencil8;
-#else
-            bool isStencilEnabled = false;
-#endif
-            isStencilEnabled =
-                isStencilEnabled || desc->pDepthStencil->pTexture->pTexture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8;
-            if (isStencilEnabled)
+            if (hasStencil)
             {
                 renderPassDesc.stencilAttachment.texture = desc->pDepthStencil->pTexture->pTexture;
                 if (desc->mUseMipSlice)
@@ -3820,7 +3863,7 @@ void cmdBindRenderTargets(Cmd* pCmd, const BindRenderTargetsDesc* pDesc)
             renderPassDesc.depthAttachment.storeAction =
                 desc->pDepthStencil->pTexture->mLazilyAllocated ? MTLStoreActionDontCare : util_to_mtl_store_action(desc->mStoreAction);
 
-            if (isStencilEnabled)
+            if (hasStencil)
             {
                 renderPassDesc.stencilAttachment.loadAction = util_to_mtl_load_action(desc->mLoadActionStencil);
                 renderPassDesc.stencilAttachment.storeAction = desc->pDepthStencil->pTexture->mLazilyAllocated
@@ -3835,7 +3878,7 @@ void cmdBindRenderTargets(Cmd* pCmd, const BindRenderTargetsDesc* pDesc)
 
             const ClearValue& clearValue = desc->mOverrideClearValue ? desc->mClearValue : desc->pDepthStencil->mClearValue;
             renderPassDesc.depthAttachment.clearDepth = clearValue.depth;
-            if (isStencilEnabled)
+            if (hasStencil)
             {
                 renderPassDesc.stencilAttachment.clearStencil = clearValue.stencil;
             }
@@ -3864,7 +3907,7 @@ void cmdBindRenderTargets(Cmd* pCmd, const BindRenderTargetsDesc* pDesc)
             }
         }
 
-        if (!pDesc->mRenderTargetCount && !hasDepth)
+        if (!pDesc->mRenderTargetCount && !hasDepthStencil)
         {
             renderPassDesc.renderTargetWidth = pDesc->mExtent[0];
             renderPassDesc.renderTargetHeight = pDesc->mExtent[1];
@@ -5880,15 +5923,27 @@ void add_texture(Renderer* pRenderer, const TextureDesc* pDesc, Texture** ppText
 
             ASSERT(pTexture->pTexture);
 
-            if (TinyImageFormat_IsDepthAndStencil(pDesc->mFormat))
+            if (TinyImageFormat_HasStencil(pDesc->mFormat))
             {
+                MTLPixelFormat targetStencilFormat = pixelFormat;
+                switch (pixelFormat)
+                {
+                case MTLPixelFormatStencil8:
+                    targetStencilFormat = MTLPixelFormatStencil8;
+                    break;
+                case MTLPixelFormatDepth32Float_Stencil8:
+                    targetStencilFormat = MTLPixelFormatDepth32Float_Stencil8;
+                    break;
 #ifndef TARGET_IOS
-                pTexture->pStencilTexture = [pTexture->pTexture
-                    newTextureViewWithPixelFormat:(pixelFormat == MTLPixelFormatDepth32Float_Stencil8 ? MTLPixelFormatX32_Stencil8
-                                                                                                      : MTLPixelFormatX24_Stencil8)];
-#else
-                pTexture->pStencilTexture = [pTexture->pTexture newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
+                case MTLPixelFormatDepth24Unorm_Stencil8:
+                    targetStencilFormat = MTLPixelFormatX24_Stencil8;
+                    break;
 #endif
+                default:
+                    ASSERTFAIL("Cannot generate stencil image view");
+                    break;
+                }
+                pTexture->pStencilTexture = [pTexture->pTexture newTextureViewWithPixelFormat:targetStencilFormat];
                 ASSERT(pTexture->pStencilTexture);
             }
         }

@@ -28,7 +28,7 @@
 
 #include "../GraphicsConfig.h"
 
-inline void vkCapsBuilder(GpuDesc* pGpuDesc)
+void vkCapsBuilder(GpuDesc* pGpuDesc)
 {
     for (uint32_t i = 0; i < TinyImageFormat_Count; ++i)
     {
@@ -58,9 +58,13 @@ inline void vkCapsBuilder(GpuDesc* pGpuDesc)
         {
             pGpuDesc->mFormatCaps[i] |= FORMAT_CAP_WRITE | FORMAT_CAP_READ_WRITE;
         }
-        if (formatSupport.optimalTilingFeatures & (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT))
+        if (formatSupport.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)
         {
             pGpuDesc->mFormatCaps[i] |= FORMAT_CAP_RENDER_TARGET;
+        }
+        if (formatSupport.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)
+        {
+            pGpuDesc->mFormatCaps[i] |= FORMAT_CAP_DEPTH_STENCIL;
         }
     }
 }

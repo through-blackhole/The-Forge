@@ -63,10 +63,10 @@
 // clang-format off
 #define NO_FSL_DEFINITIONS
 #include "../../../../Common_3/Graphics/FSL/fsl_srt.h"
-#include "Shaders/FSL/Shader_Defs.h.fsl"
-#include "Shaders/FSL/vb_resources.h.fsl"
-#include "Shaders/FSL/ASMShader_Defs.h.fsl"
-#include "Shaders/FSL/SDF_Constant.h.fsl"
+#include "Shaders/FSL/ShaderDefs.h.fsl"
+#include "Shaders/FSL/VisibilityBufferResources.h.fsl"
+#include "Shaders/FSL/ASMShaderDefs.h.fsl"
+#include "Shaders/FSL/SDFConstants.h.fsl"
 // clang-format on
 
 #include "../../../Visibility_Buffer/src/SanMiguel.h"
@@ -76,15 +76,16 @@
 
 // fsl
 #include "../../../../Common_3/Graphics/FSL/defaults.h"
-#include "./Shaders/FSL/srt.h"
-#include "./Shaders/FSL/visibility_buffer_pass.srt.h"
-#include "./Shaders/FSL/gaussian_blur.srt.h"
-#include "./Shaders/FSL/screenspace_shadows.srt.h"
-#include "./Shaders/FSL/display.srt.h"
-#include "./Shaders/FSL/quad_data.srt.h"
-#include "./Shaders/FSL/triangleFiltering.srt.h"
-#include "./Shaders/FSL/bakedSDFMeshShadow.srt.h"
-#include "./Shaders/FSL/updateRegion3DTexture.srt.h"
+#include "./Shaders/FSL/Global.srt.h"
+#include "./Shaders/FSL/VisibilityBuffer.srt.h"
+#include "./Shaders/FSL/VisibilityBufferDepthPass.srt.h"
+#include "./Shaders/FSL/GaussianBlur.srt.h"
+#include "./Shaders/FSL/ScreenSpaceShadows.srt.h"
+#include "./Shaders/FSL/Display.srt.h"
+#include "./Shaders/FSL/PackedQuads.srt.h"
+#include "./Shaders/FSL/TriangleFiltering.srt.h"
+#include "./Shaders/FSL/SDFMesh.srt.h"
+#include "./Shaders/FSL/UpdateRegion3DTexture.srt.h"
 
 #define Epilson                     (1.e-4f)
 
@@ -98,11 +99,15 @@
 #define ASM_MAX_TILES_HORIZONTAL    (ASM_WORK_BUFFER_DEPTH_PASS_WIDTH / gs_ASMTileSize)
 #define ASM_MAX_TILES_VERTICAL      (ASM_WORK_BUFFER_DEPTH_PASS_HEIGHT / gs_ASMTileSize)
 #define ASM_MAX_TILES_PER_PASS      (ASM_MAX_TILES_HORIZONTAL * ASM_MAX_TILES_VERTICAL)
+#ifndef VR_MULTIVIEW_COUNT
+#define VR_MULTIVIEW_COUNT 1
+#endif
 
 #define FOREACH_SETTING(X)       \
     X(AddGeometryPassThrough, 0) \
     X(BindlessSupported, 1)      \
-    X(MSAASampleCount, 2)
+    X(MSAASampleCount, 2)        \
+    X(DisableScreenSpaceShadows, 3)
 
 #define GENERATE_ENUM(x, y)   x,
 #define GENERATE_STRING(x, y) #x,
@@ -549,12 +554,12 @@ uint32_t gASMMaxTilesPerPass = 4;
 
 typedef struct LightUniform
 {
-    CameraMatrix mLightViewProj;
-    vec4         mLightPosition;
-    vec4         mLightColor = { 1, 0, 0, 1 };
-    vec4         mLightUpVec;
-    vec4         mTanLightAngleAndThresholdValue;
-    vec4         mLightDir;
+    mat4 mLightViewProj;
+    vec4 mLightPosition;
+    vec4 mLightColor = { 1, 0, 0, 1 };
+    vec4 mLightUpVec;
+    vec4 mTanLightAngleAndThresholdValue;
+    vec4 mLightDir;
 } LightUniform;
 
 typedef struct MeshSDFConstants
@@ -587,10 +592,10 @@ struct MSMInputConstants
 
 typedef struct CameraUniform
 {
-    mat4         mView = {};
+    CameraMatrix mView = {};
     CameraMatrix mProject = {};
     CameraMatrix mViewProject = {};
-    mat4         mInvView = {};
+    CameraMatrix mInvView = {};
     CameraMatrix mInvProj = {};
     CameraMatrix mInvViewProject = {};
     CameraMatrix mSkyViewProject = {};
@@ -631,6 +636,7 @@ typedef struct SSSInputConstants
     uint32_t mIgnoreEdgePixels = 0;
     uint32_t mBilinearSamplingOffsetMode = 0;
     uint32_t mDebugOutputMode = 0;
+    uint32_t mViewIndex = 0;
 } SSSInputConstants;
 
 struct BlurConstant
@@ -647,12 +653,6 @@ struct gBlurWeights
 struct QuadDataUniform
 {
     mat4 mModelMat;
-};
-
-struct MeshInfoUniformBlock
-{
-    mat4     mWorldViewProjMat;
-    uint32_t mViewID;
 };
 
 struct ASMAtlasQuadsUniform
@@ -713,6 +713,9 @@ static bool gFloat2RWTextureSupported = true;
 // #NOTE: Two sets of resources (one in flight and one being used on CPU)
 const uint32_t gDataBufferCount = 2;
 
+#define LEFT_EYE_VIEW_INDEX  0
+#define RIGHT_EYE_VIEW_INDEX 1
+
 /************************************************************************/
 // Render targets
 /************************************************************************/
@@ -744,6 +747,12 @@ Buffer*  pBufferSSS = NULL;
 Buffer*  pBufferSSSWaveOffsets[MAX_SSS_WAVE_OFFSETS][gDataBufferCount] = { { NULL } };
 Buffer*  pBufferGaussianBlurConstants[2][gDataBufferCount] = { { NULL } };
 
+// We are rendering the scene (geometry, skybox, ...) at this resolution, UI at window resolution (mSettings.mWidth, mSettings.mHeight)
+// Render scene at gSceneRes
+// presentImage -> The scene rendertarget composed into the swapchain/backbuffer
+// Render UI into backbuffer
+static Resolution gSceneRes;
+
 /************************************************************************/
 
 Buffer* pBufferSkyboxVertex = NULL;
@@ -773,6 +782,9 @@ DescriptorSet* pDescriptorSetTriangleFiltering = NULL;
 
 DescriptorSet* pDescriptorSetBakedSDFMeshShadow = NULL;
 DescriptorSet* pDescriptorSetUpdateRegion3DTexture = NULL;
+#ifdef QUEST_VR
+DescriptorSet* pDescriptorSetSDFShadowPerDraw = NULL;
+#endif
 
 DescriptorSet* pDescriptorSetGaussianBlurVSMPerDraw = NULL;
 DescriptorSet* pDescriptorSetGaussianBlurMSMPerDraw = NULL;
@@ -880,6 +892,7 @@ Pipeline*      pPipelineASMDEMColorToAtlas = NULL;
 Shader*        pShaderVBBufferPass[gNumGeomSets] = {};
 Pipeline*      pPipelineVBBufferPass[gNumGeomSets] = {};
 DescriptorSet* pDescriptorSetVBPass = NULL;
+DescriptorSet* pDescriptorSetDepthVBPass = NULL;
 
 #if TEST_GPU_BREADCRUMBS
 Shader*   pShaderVBBufferCrashPass = NULL;
@@ -940,7 +953,7 @@ Buffer*   pBufferMeshTransforms[MESH_COUNT][gDataBufferCount] = { { NULL } };
 Buffer*   pBufferMeshShadowProjectionTransforms[MESH_COUNT][ASM_MAX_TILES_PER_PASS][gDataBufferCount] = { { { NULL } } };
 
 Buffer* pBufferBlurWeights = NULL;
-Buffer* pBufferSSSUniform[gDataBufferCount] = { NULL };
+Buffer* pBufferSSSUniform[VR_MULTIVIEW_COUNT][gDataBufferCount] = { { NULL } };
 Buffer* pBufferCameraUniform[gDataBufferCount] = { NULL };
 
 Buffer* pBufferASMAtlasQuadsUniform[gDataBufferCount] = { NULL };
@@ -970,6 +983,9 @@ Buffer* pBufferMeshSDFConstants[gDataBufferCount] = { NULL };
 Buffer* pBufferUpdateSDFVolumeTextureAtlasConstants[gDataBufferCount] = { NULL };
 
 Buffer* pBufferSDFVolumeData[gDataBufferCount] = {};
+#ifdef QUEST_VR
+Buffer* pBufferSDFPerDraw[gDataBufferCount * VR_MULTIVIEW_COUNT] = { NULL };
+#endif
 /************************************************************************/
 // Textures/rendertargets for SDF Algorithm
 /************************************************************************/
@@ -1023,13 +1039,13 @@ bool gBufferUpdateSDFMeshConstantFlags[3] = { true, true, true };
 // Constants
 uint32_t gFrameIndex = 0;
 
-MeshInfoUniformBlock gMeshInfoUniformData[MESH_COUNT][gDataBufferCount];
+ObjectUniform gMeshInfoUniformData[MESH_COUNT][gDataBufferCount];
 
 PerFrameData gPerFrameData[gDataBufferCount] = {};
 
-uint32_t             gBlurConstantsIndex = 0;
+uint32_t            gBlurConstantsIndex = 0;
 ///
-MeshInfoUniformBlock gMeshASMProjectionInfoUniformData[MESH_COUNT][gDataBufferCount];
+ObjectShadowUniform gMeshASMProjectionInfoUniformData[MESH_COUNT][gDataBufferCount];
 
 ASMUniformBlock gAsmModelUniformBlockData = {};
 bool            preRenderSwap = false;
@@ -3343,7 +3359,7 @@ public:
         lightCameraController->moveTo(vec3(0.f));
         lightCameraController->lookAt(-m_lightDir);
 
-        m_lightRotMat = lightCameraController->getViewMatrix();
+        m_lightRotMat = lightCameraController->getViewMatrix().mCamera;
         m_invLightRotMat = inverse(m_lightRotMat);
 
         static uint32_t s_IDGen = 1;
@@ -4872,21 +4888,10 @@ public:
         // check for init success
         if (!pRenderer)
         {
-            ShowUnsupportedMessage("Failed To Initialize renderer!");
+            ShowUnsupportedMessage(getUnsupportedGPUMsg());
             return false;
         }
         setupGPUConfigurationPlatformParameters(pRenderer, settings.pExtendedSettings);
-        if (!gGpuSettings.mBindlessSupported)
-        {
-            ShowUnsupportedMessage("Visibility Buffer does not run on this device. GPU does not support enough bindless texture entries");
-            return false;
-        }
-
-        if (!pRenderer->pGpu->mPrimitiveIdSupported)
-        {
-            ShowUnsupportedMessage("Visibility Buffer does not run on this device. PrimitiveID is not supported");
-            return false;
-        }
 
         // On Mac with AMD Gpu, doesn't allow ReadWrite on texture formats with 2 component then use float4 format
         gFloat2RWTextureSupported = (pRenderer->pGpu->mFormatCaps[TinyImageFormat_R16G16_UNORM] & FORMAT_CAP_READ_WRITE) &&
@@ -4894,9 +4899,10 @@ public:
                                     (pRenderer->pGpu->mFormatCaps[TinyImageFormat_R16G16_SFLOAT] & FORMAT_CAP_READ_WRITE) &&
                                     (pRenderer->pGpu->mFormatCaps[TinyImageFormat_R32G32_SFLOAT] & FORMAT_CAP_READ_WRITE);
 
-        gAppSettings.mMsaaLevel = (SampleCount)min(1u, gGpuSettings.mMSAASampleCount);
+        gAppSettings.mMsaaLevel = (SampleCount)clamp(gGpuSettings.mMSAASampleCount, (uint32_t)SAMPLE_COUNT_1, (uint32_t)SAMPLE_COUNT_4);
         gAppSettings.mMsaaIndex = (uint32_t)log2((uint32_t)gAppSettings.mMsaaLevel);
         gAppSettings.mMsaaIndexRequested = gAppSettings.mMsaaIndex;
+        gCameraUniformData.mSSSEnabled = gGpuSettings.mDisableScreenSpaceShadows == 0;
 
         QueueDesc queueDesc = {};
         queueDesc.mType = QUEUE_TYPE_GRAPHICS;
@@ -4986,7 +4992,7 @@ public:
         BufferLoadDesc ubDesc = {};
         ubDesc.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         ubDesc.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
-        ubDesc.mDesc.mSize = sizeof(MeshInfoUniformBlock);
+        ubDesc.mDesc.mSize = sizeof(ObjectUniform);
         ubDesc.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
         ubDesc.pData = NULL;
 
@@ -5026,10 +5032,13 @@ public:
         ubSSSDesc.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
         ubSSSDesc.mDesc.mSize = sizeof(SSSInputConstants);
         ubSSSDesc.pData = &gSSSUniformData;
-        for (uint32_t i = 0; i < gDataBufferCount; i++)
+        for (uint32_t viewIndex = 0; viewIndex < VR_MULTIVIEW_COUNT; viewIndex++)
         {
-            ubSSSDesc.ppBuffer = &pBufferSSSUniform[i];
-            addResource(&ubSSSDesc, NULL);
+            for (uint32_t i = 0; i < gDataBufferCount; i++)
+            {
+                ubSSSDesc.ppBuffer = &pBufferSSSUniform[viewIndex][i];
+                addResource(&ubSSSDesc, NULL);
+            }
         }
 
         BufferLoadDesc quadUbDesc = {};
@@ -5129,6 +5138,26 @@ public:
             meshSDFUniformDesc.ppBuffer = &pBufferMeshSDFConstants[i];
             addResource(&meshSDFUniformDesc, NULL);
         }
+
+#ifdef QUEST_VR
+        BufferLoadDesc perDrawSDFData = {};
+        perDrawSDFData.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        perDrawSDFData.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+        perDrawSDFData.mDesc.mSize = sizeof(SDFPerDrawData);
+        perDrawSDFData.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+        SDFPerDrawData perDrawData[gDataBufferCount * VR_MULTIVIEW_COUNT] = { {} };
+        for (uint32_t i = 0; i < gDataBufferCount; ++i)
+        {
+            for (uint32_t viewIndex = 0; viewIndex < VR_MULTIVIEW_COUNT; ++viewIndex)
+            {
+                const uint32_t bufferIndex = i * VR_MULTIVIEW_COUNT + viewIndex;
+                perDrawData[bufferIndex] = { viewIndex };
+                perDrawSDFData.pData = &perDrawData[bufferIndex];
+                perDrawSDFData.ppBuffer = &pBufferSDFPerDraw[bufferIndex];
+                addResource(&perDrawSDFData, &token);
+            }
+        }
+#endif
 
         BufferLoadDesc updateSDFVolumeTextureAtlasUniformDesc = {};
         updateSDFVolumeTextureAtlasUniformDesc.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -5632,13 +5661,22 @@ public:
             removeResource(pBufferMeshSDFConstants[i]);
             removeResource(pBufferUpdateSDFVolumeTextureAtlasConstants[i]);
             removeResource(pBufferSDFVolumeData[i]);
+#ifdef QUEST_VR
+            for (uint32_t viewIndex = 0; viewIndex < VR_MULTIVIEW_COUNT; ++viewIndex)
+            {
+                removeResource(pBufferSDFPerDraw[i * VR_MULTIVIEW_COUNT + viewIndex]);
+            }
+#endif
         }
         removeResource(pBufferBlurConstants);
         removeResource(pBufferBlurWeights);
 
         for (uint32_t i = 0; i < gDataBufferCount; i++)
         {
-            removeResource(pBufferSSSUniform[i]);
+            for (uint32_t viewIndex = 0; viewIndex < VR_MULTIVIEW_COUNT; viewIndex++)
+            {
+                removeResource(pBufferSSSUniform[viewIndex][i]);
+            }
         }
         removeResource(pBufferMeshConstants);
         removeResource(pBufferQuadVertex);
@@ -5692,6 +5730,8 @@ public:
 
     bool Load(ReloadDesc* pReloadDesc) override
     {
+        gSceneRes = getGPUCfgSceneResolution(mSettings.mWidth, mSettings.mHeight);
+
         if (pReloadDesc->mType & RELOAD_TYPE_SHADER)
         {
             addShaders();
@@ -5812,7 +5852,10 @@ public:
 
             if (!addSwapChain())
                 return false;
+        }
 
+        if (pReloadDesc->mType & (RELOAD_TYPE_RESIZE | RELOAD_TYPE_RENDERTARGET | RELOAD_TYPE_SCENE_RESOLUTION))
+        {
             addRenderTargets();
             Load_ASM_RenderTargets();
 
@@ -5862,14 +5905,7 @@ public:
 
         if (pReloadDesc->mType & (RELOAD_TYPE_RESIZE | RELOAD_TYPE_RENDERTARGET))
         {
-            removeRenderTargets();
             removeSwapChain(pRenderer, pSwapChain);
-
-            if (pUIASMDebugTexturesWindow)
-            {
-                uiRemoveComponent(pUIASMDebugTexturesWindow);
-                pUIASMDebugTexturesWindow = NULL;
-            }
 
             GuiController::removeGui();
             uiRemoveComponent(pGuiWindow);
@@ -5878,6 +5914,16 @@ public:
             unloadProfilerUI();
 
             ESRAM_RESET_ALLOCS(pRenderer);
+        }
+
+        if (pReloadDesc->mType & (RELOAD_TYPE_RESIZE | RELOAD_TYPE_RENDERTARGET | RELOAD_TYPE_SCENE_RESOLUTION))
+        {
+            removeRenderTargets();
+            if (pUIASMDebugTexturesWindow)
+            {
+                uiRemoveComponent(pUIASMDebugTexturesWindow);
+                pUIASMDebugTexturesWindow = NULL;
+            }
         }
 
         if (pReloadDesc->mType & RELOAD_TYPE_SHADER)
@@ -6161,7 +6207,7 @@ public:
             cmdBindPipeline(cmd, pPipelines[i]);
             cmdBindDescriptorSet(cmd, 0, pDescriptorSetPersistent);
             cmdBindDescriptorSet(cmd, gFrameIndex, pDescriptorSetPerFrame);
-            cmdBindDescriptorSet(cmd, gFrameIndex * 2 + 1, pDescriptorSetVBPass);
+            cmdBindDescriptorSet(cmd, gFrameIndex, pDescriptorSetDepthVBPass);
 
             uint64_t indirectBufferByteOffset = GET_INDIRECT_DRAW_ELEM_INDEX(VIEW_SHADOW, i, 0) * sizeof(uint32_t);
             Buffer*  pIndirectDrawBuffer = pVisibilityBuffer->ppIndirectDrawArgBuffer[0];
@@ -6233,7 +6279,7 @@ public:
         cmdEndGpuTimestampQuery(cmd, gCurrentGpuProfileToken);
     }
 
-    void computeScreenSpaceShadows(Cmd* cmd)
+    void computeScreenSpaceShadows(Cmd* cmd, uint32_t viewIndex)
     {
         if (!gCameraUniformData.mSSSEnabled)
         {
@@ -6251,7 +6297,12 @@ public:
 
         vec3 lightDir = normalize(-gCameraUniformData.mLight.mLightDir.getXYZ());
         mat4 viewProject = gCameraUniformData.mViewProject.mCamera;
-
+#if defined(QUEST_VR)
+        if (viewIndex == RIGHT_EYE_VIEW_INDEX)
+        {
+            viewProject = gCameraUniformData.mViewProject.mRightEye;
+        }
+#endif
         vec4      lightProjection = viewProject * vec4(lightDir, 0.0f);
         const int waveSize = 64;
 
@@ -6264,8 +6315,8 @@ public:
 
         float4 mLightCoordinate;
 
-        mLightCoordinate[0] = ((lightProjection[0] / xy_light_w) * +0.5f + 0.5f) * (float)mSettings.mWidth;
-        mLightCoordinate[1] = ((lightProjection[1] / xy_light_w) * -0.5f + 0.5f) * (float)mSettings.mHeight;
+        mLightCoordinate[0] = ((lightProjection[0] / xy_light_w) * +0.5f + 0.5f) * (float)gSceneRes.mWidth;
+        mLightCoordinate[1] = ((lightProjection[1] / xy_light_w) * -0.5f + 0.5f) * (float)gSceneRes.mHeight;
         mLightCoordinate[2] = lightProjection[3] == 0 ? 0.0f : (lightProjection[2] / lightProjection[3]);
         mLightCoordinate[3] = lightProjection[3] > 0 ? 1.0f : -1.0f;
 
@@ -6274,8 +6325,8 @@ public:
         // Make the bounds relative to the light
         const int biased_bounds[4] = {
             -light_xy[0],
-            -(mSettings.mHeight - light_xy[1]),
-            mSettings.mWidth - light_xy[0],
+            -((int32_t)gSceneRes.mHeight - light_xy[1]),
+            (int32_t)gSceneRes.mWidth - light_xy[0],
             light_xy[1],
         };
 
@@ -6382,12 +6433,15 @@ public:
             dispatchList[i].WaveOffset[1] *= waveSize;
         }
 
-        cmdBeginGpuTimestampQuery(cmd, gCurrentGpuProfileToken, "Clear Screen Space Shadows");
+        char pClearTimestampQueryString[64];
+        snprintf(pClearTimestampQueryString, 64, "Clear Screen Space Shadows (%u)", viewIndex);
+        cmdBeginGpuTimestampQuery(cmd, gCurrentGpuProfileToken, pClearTimestampQueryString);
 
-        gSSSUniformData.mScreenSize = float4((float)mSettings.mWidth, (float)mSettings.mHeight, 0.0f, 0.0f);
+        gSSSUniformData.mScreenSize = float4((float)gSceneRes.mWidth, (float)gSceneRes.mHeight, 0.0f, 0.0f);
         gSSSUniformData.mLightCoordinate = mLightCoordinate;
+        gSSSUniformData.mViewIndex = viewIndex;
 
-        BufferUpdateDesc bufferUpdate = { pBufferSSSUniform[gFrameIndex] };
+        BufferUpdateDesc bufferUpdate = { pBufferSSSUniform[viewIndex][gFrameIndex] };
         beginUpdateResource(&bufferUpdate);
         memcpy(bufferUpdate.pMappedData, &gSSSUniformData, sizeof(gSSSUniformData));
         endUpdateResource(&bufferUpdate);
@@ -6406,10 +6460,10 @@ public:
 
         cmdBindPipeline(cmd, pPipelineSSSClear);
         cmdBindDescriptorSet(cmd, 0, pDescriptorSetPersistent);
-        cmdBindDescriptorSet(cmd, gFrameIndex, pDescriptorSetSSSPerBatch);
+        cmdBindDescriptorSet(cmd, viewIndex * gDataBufferCount + gFrameIndex, pDescriptorSetSSSPerBatch);
 
-        uint32_t dispatchSizeX = (mSettings.mWidth + 7) / 8;
-        uint32_t dispatchSizeY = (mSettings.mHeight + 7) / 8;
+        uint32_t dispatchSizeX = (gSceneRes.mWidth + 7) / 8;
+        uint32_t dispatchSizeY = (gSceneRes.mHeight + 7) / 8;
         cmdDispatch(cmd, dispatchSizeX, dispatchSizeY, 1);
 
         if (gSupportTextureAtomics)
@@ -6425,7 +6479,9 @@ public:
 
         cmdEndGpuTimestampQuery(cmd, gCurrentGpuProfileToken);
 
-        cmdBeginGpuTimestampQuery(cmd, gCurrentGpuProfileToken, "Compute Screen Space Shadows");
+        char pComputeTimestampQueryString[64];
+        snprintf(pComputeTimestampQueryString, 64, "Compute Screen Space Shadows (%u)", viewIndex);
+        cmdBeginGpuTimestampQuery(cmd, gCurrentGpuProfileToken, pComputeTimestampQueryString);
 
         Pipeline* pipeline = pPipelineSSS;
 #if TEST_GPU_BREADCRUMBS
@@ -6449,7 +6505,7 @@ public:
 #endif
         cmdBindPipeline(cmd, pipeline);
         cmdBindDescriptorSet(cmd, 0, pDescriptorSetPersistent);
-        cmdBindDescriptorSet(cmd, gFrameIndex, pDescriptorSetSSSPerBatch);
+        cmdBindDescriptorSet(cmd, viewIndex * gDataBufferCount + gFrameIndex, pDescriptorSetSSSPerBatch);
 
         // Dispatch the compute shader
         for (int i = 0; i < dispatchCount; i++)
@@ -6510,28 +6566,43 @@ public:
         cmdEndGpuTimestampQuery(cmd, gCurrentGpuProfileToken);
     }
 
-    void drawSDFMeshVisualizationOnScene(Cmd* cmd)
+    void drawSDFMeshVisualizationOnScene(Cmd* cmd, uint32_t viewIndex)
     {
-        cmdBeginGpuTimestampQuery(cmd, gCurrentGpuProfileToken, "Visualize SDF Geometry On The Scene");
+        char pDrawMeshVisMarkerName[128];
+        snprintf(pDrawMeshVisMarkerName, 128, "Visualize SDF Geometry On The Scene (%u)", viewIndex);
+        cmdBeginGpuTimestampQuery(cmd, gCurrentGpuProfileToken, pDrawMeshVisMarkerName);
 
         cmdBindPipeline(cmd, pPipelineSDFMeshVisualization);
         cmdBindDescriptorSet(cmd, 0, pDescriptorSetPersistent);
         cmdBindDescriptorSet(cmd, 0, pDescriptorSetBakedSDFMeshShadow);
         cmdBindDescriptorSet(cmd, gFrameIndex, pDescriptorSetPerFrame);
+
+#ifdef QUEST_VR
+        const uint32_t bufferIndex = gFrameIndex * VR_MULTIVIEW_COUNT + viewIndex;
+        cmdBindDescriptorSet(cmd, bufferIndex, pDescriptorSetSDFShadowPerDraw);
+#endif
+
         cmdDispatch(cmd, (uint32_t)ceil((float)(pRenderTargetSDFMeshVisualization->mWidth) / (float)(SDF_MESH_VISUALIZATION_THREAD_X)),
                     (uint32_t)ceil((float)(pRenderTargetSDFMeshVisualization->mHeight) / (float)(SDF_MESH_VISUALIZATION_THREAD_Y)), 1);
 
         cmdEndGpuTimestampQuery(cmd, gCurrentGpuProfileToken);
     }
 
-    void drawSDFMeshShadow(Cmd* cmd)
+    void drawSDFMeshShadow(Cmd* cmd, uint32_t viewIndex)
     {
-        cmdBeginGpuTimestampQuery(cmd, gCurrentGpuProfileToken, "Draw SDF mesh shadow");
+        char pDrawMeshSDFShadowMarkerName[128];
+        snprintf(pDrawMeshSDFShadowMarkerName, 128, "Draw SDF mesh shadow (%u)", viewIndex);
+        cmdBeginGpuTimestampQuery(cmd, gCurrentGpuProfileToken, pDrawMeshSDFShadowMarkerName);
 
         cmdBindPipeline(cmd, pPipelineSDFMeshShadow);
         cmdBindDescriptorSet(cmd, 0, pDescriptorSetPersistent);
         cmdBindDescriptorSet(cmd, 0, pDescriptorSetBakedSDFMeshShadow);
         cmdBindDescriptorSet(cmd, gFrameIndex, pDescriptorSetPerFrame);
+
+#ifdef QUEST_VR
+        const uint32_t bufferIndex = gFrameIndex * VR_MULTIVIEW_COUNT + viewIndex;
+        cmdBindDescriptorSet(cmd, bufferIndex, pDescriptorSetSDFShadowPerDraw);
+#endif
 
         cmdDispatch(cmd, (uint32_t)ceil((float)(pTextureSDFMeshShadow->mWidth) / (float)(SDF_MESH_SHADOW_THREAD_X)),
                     (uint32_t)ceil((float)(pTextureSDFMeshShadow->mHeight) / (float)(SDF_MESH_SHADOW_THREAD_Y)),
@@ -6619,7 +6690,7 @@ public:
 
             cmdBindDescriptorSet(cmd, 0, pDescriptorSetPersistent);
             cmdBindDescriptorSet(cmd, gFrameIndex, pDescriptorSetPerFrame);
-            cmdBindDescriptorSet(cmd, gFrameIndex * 2 + 0, pDescriptorSetVBPass);
+            cmdBindDescriptorSet(cmd, gFrameIndex, pDescriptorSetVBPass);
 
             uint64_t indirectBufferByteOffset = GET_INDIRECT_DRAW_ELEM_INDEX(VIEW_CAMERA, i, 0) * sizeof(uint32_t);
             Buffer*  pIndirectDrawBuffer = pVisibilityBuffer->ppIndirectDrawArgBuffer[0];
@@ -6627,8 +6698,8 @@ public:
 
             cmdEndGpuTimestampQuery(cmd, gCurrentGpuProfileToken);
         }
-        cmdEndGpuTimestampQuery(cmd, gCurrentGpuProfileToken);
         cmdBindRenderTargets(cmd, NULL);
+        cmdEndGpuTimestampQuery(cmd, gCurrentGpuProfileToken);
     }
 
     // Render a fullscreen triangle to evaluate shading for every pixel.This render step uses the render target generated by
@@ -6727,7 +6798,7 @@ public:
         prerenderIndirectionRenderData.m_pGraphicsPipeline = pPipelineASMFillIndirection;
 
         ASMProjectionData mainViewProjection;
-        mainViewProjection.mViewMat = gCameraUniformData.mView;
+        mainViewProjection.mViewMat = gCameraUniformData.mView.mCamera;
         mainViewProjection.mProjMat = gCameraUniformData.mProject;
         mainViewProjection.mInvViewMat = inverse(mainViewProjection.mViewMat);
         mainViewProjection.mInvProjMat = CameraMatrix::inverse(mainViewProjection.mProjMat);
@@ -6752,6 +6823,9 @@ public:
                 vec2 windowSize = vec2(gs_ASMDepthAtlasTextureWidth, gs_ASMDepthAtlasTextureHeight);
                 gVBConstants[gFrameIndex].cullingViewports[VIEW_SHADOW + i].windowSize = v2ToF2(windowSize);
                 gVBConstants[gFrameIndex].numViewports = (uint32_t)size + 1;
+#ifdef QUEST_VR
+                gVBConstants[gFrameIndex].cullingMVP[VIEW_SHADOW + i] = gVBConstants[gFrameIndex].transform[VIEW_SHADOW + i].mvp.mCamera;
+#endif
             }
             tf_free(renderBatchProjection);
         }
@@ -6760,7 +6834,7 @@ public:
     void drawASM(Cmd* cmd)
     {
         ASMProjectionData mainViewProjection;
-        mainViewProjection.mViewMat = gCameraUniformData.mView;
+        mainViewProjection.mViewMat = gCameraUniformData.mView.mCamera;
         mainViewProjection.mProjMat = gCameraUniformData.mProject;
         mainViewProjection.mInvViewMat = inverse(mainViewProjection.mViewMat);
         mainViewProjection.mInvProjMat = CameraMatrix::inverse(mainViewProjection.mProjMat);
@@ -6797,12 +6871,12 @@ public:
     void UpdateUniformData()
     {
         // update camera with time
-        mat4           viewMat = pCameraController->getViewMatrix();
+        CameraMatrix   viewMat = pCameraController->getViewMatrix();
         /************************************************************************/
         // Update Camera
         /************************************************************************/
-        const uint32_t width = mSettings.mWidth;
-        const uint32_t height = mSettings.mHeight;
+        const uint32_t width = gSceneRes.mWidth;
+        const uint32_t height = gSceneRes.mHeight;
 
         float           aspectInverse = (float)height / (float)width;
         constexpr float horizontal_fov = PI / 2.0f;
@@ -6814,7 +6888,7 @@ public:
         gCameraUniformData.mProject = projMat;
         gCameraUniformData.mViewProject = projMat * viewMat;
         gCameraUniformData.mInvProj = CameraMatrix::inverse(projMat);
-        gCameraUniformData.mInvView = inverse(viewMat);
+        gCameraUniformData.mInvView = CameraMatrix::inverse(viewMat);
         gCameraUniformData.mInvViewProject = CameraMatrix::inverse(gCameraUniformData.mViewProject);
         gCameraUniformData.mNear = nearValue;
         gCameraUniformData.mFarNearDiff = farValue - nearValue; // if OpenGL convention was used this would be 2x the value
@@ -6843,7 +6917,10 @@ public:
         /************************************************************************/
         // Skybox
         /************************************************************************/
-        viewMat.setTranslation(vec3(0));
+        viewMat.mCamera.setTranslation(vec3(0));
+#ifdef QUEST_VR
+        viewMat.mRightEye.setTranslation(vec3(0));
+#endif
         gCameraUniformData.mSkyViewProject =
             CameraMatrix::perspectiveReverseZ(horizontal_fov, aspectInverse, nearValue, farValue) * viewMat;
 
@@ -6857,9 +6934,9 @@ public:
         mat4 rotation = mat4::rotationXY(gLightCpuSettings.mSunControl.x, gLightCpuSettings.mSunControl.y);
         mat4 translation = mat4::translation(-vec3(lightSourcePos));
 
-        vec3         newLightDir = vec4(inverse(rotation) * vec4(0, 0, 1, 0)).getXYZ();
-        CameraMatrix lightProjMat = CameraMatrix::orthographicReverseZ(-140, 140, -210, 90, -220, 100);
-        mat4         lightView = rotation * translation;
+        vec3 newLightDir = vec4(inverse(rotation) * vec4(0, 0, 1, 0)).getXYZ();
+        mat4 lightProjMat = mat4::orthographicLH_ReverseZ(-140, 140, -210, 90, -220, 100);
+        mat4 lightView = rotation * translation;
 
         gCameraUniformData.mLight.mLightPosition = vec4(0.f);
         gCameraUniformData.mLight.mLightViewProj = lightProjMat * lightView;
@@ -6878,7 +6955,7 @@ public:
             mat4 offsetTranslationMat = mat4::translation(f3Tov3(gMeshInfoData[i].mOffsetTranslation));
             gMeshInfoData[i].mWorldMat = gMeshInfoData[i].mTranslationMat * gMeshInfoData[i].mScaleMat * offsetTranslationMat;
 
-            gMeshInfoUniformData[i][gFrameIndex].mWorldViewProjMat = gCameraUniformData.mViewProject.mCamera * gMeshInfoData[i].mWorldMat;
+            gMeshInfoUniformData[i][gFrameIndex].mWorldViewProjMat = gCameraUniformData.mViewProject * gMeshInfoData[i].mWorldMat;
 
             if (gCurrentShadowType == SHADOW_TYPE_ASM)
             {
@@ -6888,17 +6965,23 @@ public:
                      gCurrentShadowType == SHADOW_TYPE_MSM)
             {
                 gMeshASMProjectionInfoUniformData[i][gFrameIndex].mWorldViewProjMat =
-                    gCameraUniformData.mLight.mLightViewProj.mCamera * gMeshInfoData[i].mWorldMat;
+                    gCameraUniformData.mLight.mLightViewProj * gMeshInfoData[i].mWorldMat;
                 gMeshASMProjectionInfoUniformData[i][gFrameIndex].mViewID = VIEW_SHADOW;
             }
         }
 
-        // only for view camera, for shadow it depends on the alggorithm being uysed
-        gPerFrameData[gFrameIndex].gEyeObjectSpace[VIEW_CAMERA] = (gCameraUniformData.mInvView * vec4(0.f, 0.f, 0.f, 1.f)).getXYZ();
+        // only for view camera, for shadow it depends on the alggorithm being used
+        gPerFrameData[gFrameIndex].gEyeObjectSpace[VIEW_CAMERA] = (gCameraUniformData.mInvView.mCamera * vec4(0.f, 0.f, 0.f, 1.f)).getXYZ();
 
         gVBConstants[gFrameIndex].transform[VIEW_CAMERA].mvp = gCameraUniformData.mViewProject * gMeshInfoData[0].mWorldMat;
-        gVBConstants[gFrameIndex].cullingViewports[VIEW_CAMERA].windowSize = { (float)mSettings.mWidth, (float)mSettings.mHeight };
+        gVBConstants[gFrameIndex].cullingViewports[VIEW_CAMERA].windowSize = { (float)gSceneRes.mWidth, (float)gSceneRes.mHeight };
         gVBConstants[gFrameIndex].cullingViewports[VIEW_CAMERA].sampleCount = gAppSettings.mMsaaLevel;
+#ifdef QUEST_VR
+        mat4 superFrustumView;
+        mat4 superFrustumProject;
+        CameraMatrix::superFrustumReverseZ(gCameraUniformData.mView, nearValue, farValue, superFrustumView, superFrustumProject);
+        gVBConstants[gFrameIndex].cullingMVP[VIEW_CAMERA] = (superFrustumProject * superFrustumView) * gMeshInfoData[0].mWorldMat;
+#endif
         gVBConstants[gFrameIndex].numViewports = 2;
     }
 
@@ -6944,9 +7027,14 @@ public:
         else if (gCurrentShadowType == SHADOW_TYPE_ESM || gCurrentShadowType == SHADOW_TYPE_VSM || gCurrentShadowType == SHADOW_TYPE_MSM)
         {
             gPerFrameData[gFrameIndex].gEyeObjectSpace[VIEW_SHADOW] =
-                (CameraMatrix::inverse(gCameraUniformData.mLight.mLightViewProj).mCamera * vec4(0.f, 0.f, 0.f, 1.f)).getXYZ();
+                (inverse(gCameraUniformData.mLight.mLightViewProj) * vec4(0.f, 0.f, 0.f, 1.f)).getXYZ();
 
-            gVBConstants[gFrameIndex].transform[VIEW_SHADOW].mvp = gCameraUniformData.mLight.mLightViewProj * gMeshInfoData[0].mWorldMat;
+            gVBConstants[gFrameIndex].transform[VIEW_SHADOW].mvp.mCamera =
+                gCameraUniformData.mLight.mLightViewProj * gMeshInfoData[0].mWorldMat;
+#ifdef QUEST_VR
+            gVBConstants[gFrameIndex].transform[VIEW_SHADOW].mvp.mRightEye = gVBConstants[gFrameIndex].transform[VIEW_SHADOW].mvp.mCamera;
+            gVBConstants[gFrameIndex].cullingMVP[VIEW_SHADOW] = gVBConstants[gFrameIndex].transform[VIEW_SHADOW].mvp.mCamera;
+#endif
             gVBConstants[gFrameIndex].cullingViewports[VIEW_SHADOW].sampleCount = 1;
 
             vec2 windowSize = vec2(SHADOWMAP_RES, SHADOWMAP_RES);
@@ -6959,6 +7047,9 @@ public:
 
             gVBConstants[gFrameIndex].transform[VIEW_SHADOW].mvp = gVBConstants[gFrameIndex].transform[VIEW_CAMERA].mvp;
             gVBConstants[gFrameIndex].cullingViewports[VIEW_SHADOW] = gVBConstants[gFrameIndex].cullingViewports[VIEW_CAMERA];
+#ifdef QUEST_VR
+            gVBConstants[gFrameIndex].cullingMVP[VIEW_SHADOW] = gVBConstants[gFrameIndex].cullingMVP[VIEW_CAMERA];
+#endif
             gVBConstants[gFrameIndex].numViewports = 2;
         }
 
@@ -6987,6 +7078,7 @@ public:
         beginUpdateResource(&updateVisibilityBufferConstantDesc);
         memcpy(updateVisibilityBufferConstantDesc.pMappedData, &gVBConstants[gFrameIndex], sizeof(gVBConstants[gFrameIndex]));
         endUpdateResource(&updateVisibilityBufferConstantDesc);
+
         /************************************************************************/
         // Rendering
         /************************************************************************/
@@ -7125,7 +7217,10 @@ public:
                 gCurrentShadowType == SHADOW_TYPE_MSM)
             {
                 drawVisibilityBufferPass(cmd);
-                computeScreenSpaceShadows(cmd);
+                for (uint32_t viewIndex = 0; viewIndex < VR_MULTIVIEW_COUNT; ++viewIndex)
+                {
+                    computeScreenSpaceShadows(cmd, viewIndex);
+                }
                 drawVisibilityBufferShade(cmd, gFrameIndex);
             }
             else if (gCurrentShadowType == SHADOW_TYPE_MESH_BAKED_SDF)
@@ -7152,7 +7247,12 @@ public:
                 }
 
                 drawVisibilityBufferPass(cmd);
-                computeScreenSpaceShadows(cmd);
+
+                for (uint32_t viewIndex = 0; viewIndex < VR_MULTIVIEW_COUNT; ++viewIndex)
+                {
+                    computeScreenSpaceShadows(cmd, viewIndex);
+                }
+
                 if (volumeTextureNode || gBufferUpdateSDFMeshConstantFlags[gFrameIndex])
                 {
                     if (!volumeTextureNode)
@@ -7170,7 +7270,10 @@ public:
                     barriers[1] = { pRenderTargetSDFMeshVisualization, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS };
                     cmdResourceBarrier(cmd, 0, NULL, 1, textureBarriers, 2, barriers);
 
-                    drawSDFMeshVisualizationOnScene(cmd);
+                    for (uint32_t viewIndex = 0; viewIndex < VR_MULTIVIEW_COUNT; ++viewIndex)
+                    {
+                        drawSDFMeshVisualizationOnScene(cmd, viewIndex);
+                    }
 
                     barriers[1] = { pRenderTargetSDFMeshVisualization, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE };
                     cmdResourceBarrier(cmd, 0, NULL, 0, NULL, 1, &barriers[1]);
@@ -7180,7 +7283,10 @@ public:
                     textureBarriers[1] = { pTextureSDFMeshShadow, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS };
                     cmdResourceBarrier(cmd, 0, NULL, 2, textureBarriers, 1, barriers);
 
-                    drawSDFMeshShadow(cmd);
+                    for (uint32_t viewIndex = 0; viewIndex < VR_MULTIVIEW_COUNT; ++viewIndex)
+                    {
+                        drawSDFMeshShadow(cmd, viewIndex);
+                    }
 
                     textureBarriers[1] = { pTextureSDFMeshShadow, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE };
                     cmdResourceBarrier(cmd, 0, NULL, 1, &textureBarriers[1], 0, NULL);
@@ -7240,6 +7346,7 @@ public:
             presentImage(cmd, pSrcRT->pTexture, index, pRenderTarget);
 
             drawGUI(cmd, swapchainImageIndex);
+
             {
                 const uint32_t      numBarriers = NUM_CULLING_VIEWPORTS + 2;
                 RenderTargetBarrier barrierPresent = { pRenderTarget, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_PRESENT };
@@ -7313,6 +7420,7 @@ public:
 
     void drawGUI(Cmd* cmd, uint32_t frameIdx)
     {
+#ifndef QUEST_VR
         cmdBeginGpuTimestampQuery(cmd, gCurrentGpuProfileToken, "Draw UI");
 
         BindRenderTargetsDesc bindRenderTargets = {};
@@ -7334,6 +7442,7 @@ public:
         cmdBindRenderTargets(cmd, NULL);
 
         cmdEndGpuTimestampQuery(cmd, gCurrentGpuProfileToken);
+#endif
     }
 
     void presentImage(Cmd* cmd, Texture* pSrc, uint32_t index, RenderTarget* pDstCol)
@@ -7378,8 +7487,8 @@ public:
 
     void addRenderTargets() const
     {
-        const uint32_t width = mSettings.mWidth;
-        const uint32_t height = mSettings.mHeight;
+        const uint32_t sceneWidth = gSceneRes.mWidth;
+        const uint32_t sceneHeight = gSceneRes.mHeight;
 
         const ClearValue depthStencilClear = { { 0.0f, 0 } };
         // Used for ESM render target shadow
@@ -7393,6 +7502,9 @@ public:
         /************************************************************************/
         // Main depth buffer
         /************************************************************************/
+        uint32_t currentOffsetESRAM = 0;
+
+        ESRAM_BEGIN_ALLOC(pRenderer, "Depth", currentOffsetESRAM);
         RenderTargetDesc depthRT = {};
         depthRT.mArraySize = 1;
         depthRT.mClearValue = depthStencilClear;
@@ -7400,17 +7512,22 @@ public:
         depthRT.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
         depthRT.mFormat = TinyImageFormat_D32_SFLOAT;
         depthRT.mStartState = RESOURCE_STATE_DEPTH_WRITE;
-        depthRT.mWidth = width;
-        depthRT.mHeight = height;
+        depthRT.mWidth = sceneWidth;
+        depthRT.mHeight = sceneHeight;
         depthRT.mSampleCount = gAppSettings.mMsaaLevel;
         depthRT.mSampleQuality = 0;
         depthRT.pName = "Depth RT";
-        depthRT.mFlags = gAppSettings.mMsaaLevel > SAMPLE_COUNT_2 ? TEXTURE_CREATION_FLAG_NONE
-                                                                  : (TEXTURE_CREATION_FLAG_ESRAM | TEXTURE_CREATION_FLAG_VR_MULTIVIEW);
+        depthRT.mFlags = (gAppSettings.mMsaaLevel > SAMPLE_COUNT_2 ? TEXTURE_CREATION_FLAG_NONE : TEXTURE_CREATION_FLAG_ESRAM) |
+                         TEXTURE_CREATION_FLAG_VR_MULTIVIEW;
         addRenderTarget(pRenderer, &depthRT, &pRenderTargetDepth);
+
+        ESRAM_CURRENT_OFFSET(pRenderer, depthOffsetESRAM);
+        ESRAM_END_ALLOC(pRenderer);
+
         /************************************************************************/
         // Intermediate render target
         /************************************************************************/
+        ESRAM_BEGIN_ALLOC(pRenderer, "Intermediate", currentOffsetESRAM);
         RenderTargetDesc postProcRTDesc = {};
         postProcRTDesc.mArraySize = 1;
         postProcRTDesc.mClearValue = { { 0.0f, 0.0f, 0.0f, 0.0f } };
@@ -7418,17 +7535,25 @@ public:
         postProcRTDesc.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
         postProcRTDesc.mFormat = pSwapChain->mFormat;
         postProcRTDesc.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
-        postProcRTDesc.mHeight = mSettings.mHeight;
-        postProcRTDesc.mWidth = mSettings.mWidth;
+        postProcRTDesc.mHeight = sceneHeight;
+        postProcRTDesc.mWidth = sceneWidth;
         postProcRTDesc.mSampleCount = pSwapChain->ppRenderTargets[0]->mSampleCount;
         postProcRTDesc.mSampleQuality = pSwapChain->ppRenderTargets[0]->mSampleQuality;
         postProcRTDesc.pName = "pIntermediateRenderTarget";
         postProcRTDesc.mFlags = TEXTURE_CREATION_FLAG_VR_MULTIVIEW;
+        postProcRTDesc.mFlags |= TEXTURE_CREATION_FLAG_ESRAM;
         addRenderTarget(pRenderer, &postProcRTDesc, &pRenderTargetIntermediate);
+
+        ESRAM_CURRENT_OFFSET(pRenderer, intermediateOffsetESRAM);
+        ESRAM_END_ALLOC(pRenderer);
+
+        currentOffsetESRAM = max(intermediateOffsetESRAM, depthOffsetESRAM);
 
         /************************************************************************/
         // Shadow Map Render Target
         /************************************************************************/
+        ESRAM_BEGIN_ALLOC(pRenderer, "Shadow Map", currentOffsetESRAM);
+
         RenderTargetDesc shadowRTDesc = {};
         shadowRTDesc.mArraySize = 1;
         shadowRTDesc.mClearValue.depth = depthStencilClear.depth;
@@ -7450,7 +7575,58 @@ public:
         shadowRTDesc.mSampleCount = (SampleCount)ESM_MSAA_SAMPLES;
         shadowRTDesc.mSampleQuality = 0;
         shadowRTDesc.pName = "Shadow Map RT";
+        shadowRTDesc.mFlags = TEXTURE_CREATION_FLAG_ESRAM;
         addRenderTarget(pRenderer, &shadowRTDesc, &pRenderTargetShadowMap);
+
+        ESRAM_CURRENT_OFFSET(pRenderer, shadowMapOffsetESRAM);
+        ESRAM_END_ALLOC(pRenderer);
+        currentOffsetESRAM = max(shadowMapOffsetESRAM, currentOffsetESRAM);
+
+        /************************************************************************/
+        // Screen Space Shadow Map Render Target
+        /************************************************************************/
+        ESRAM_BEGIN_ALLOC(pRenderer, "Screen Space Shadows", currentOffsetESRAM);
+        if (gSupportTextureAtomics)
+        {
+            TextureDesc SSSRTDesc = {};
+            SSSRTDesc.mWidth = sceneWidth;
+            SSSRTDesc.mHeight = sceneHeight;
+            SSSRTDesc.mDepth = 1;
+            SSSRTDesc.mArraySize = VR_MULTIVIEW_COUNT;
+            SSSRTDesc.mMipLevels = 1;
+            SSSRTDesc.mSampleCount = SAMPLE_COUNT_1;
+            SSSRTDesc.mFormat = TinyImageFormat_R32_UINT;
+            SSSRTDesc.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+            SSSRTDesc.mClearValue.r = 1.0f;
+            SSSRTDesc.mClearValue.g = 1.0f;
+            SSSRTDesc.mClearValue.b = 1.0f;
+            SSSRTDesc.mClearValue.a = 1.0f;
+            SSSRTDesc.mDescriptors = DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE;
+            SSSRTDesc.mFlags |= TEXTURE_CREATION_FLAG_ESRAM;
+            SSSRTDesc.pName = "Screen Space Shadows Texture";
+
+            TextureLoadDesc SSSTextureLoadDesc = {};
+            SSSTextureLoadDesc.pDesc = &SSSRTDesc;
+            SSSTextureLoadDesc.ppTexture = &pTextureSSS;
+            addResource(&SSSTextureLoadDesc, NULL);
+        }
+        else
+        {
+            BufferLoadDesc SSSRTDesc = {};
+            SSSRTDesc.mDesc.mDescriptors = DESCRIPTOR_TYPE_BUFFER | DESCRIPTOR_TYPE_RW_BUFFER;
+            SSSRTDesc.mDesc.mElementCount = sceneWidth * sceneHeight;
+            SSSRTDesc.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+            SSSRTDesc.mDesc.mFlags = BUFFER_CREATION_FLAG_OWN_MEMORY_BIT;
+            SSSRTDesc.mDesc.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+            SSSRTDesc.mDesc.mStructStride = sizeof(uint);
+            SSSRTDesc.mDesc.mSize = (uint64_t)SSSRTDesc.mDesc.mElementCount * SSSRTDesc.mDesc.mStructStride;
+            SSSRTDesc.mDesc.pName = "Screen Space Shadows Buffer";
+            SSSRTDesc.ppBuffer = &pBufferSSS;
+            addResource(&SSSRTDesc, NULL);
+        }
+        ESRAM_CURRENT_OFFSET(pRenderer, screenShadowOffsetESRAM);
+        ESRAM_END_ALLOC(pRenderer);
+        currentOffsetESRAM = max(screenShadowOffsetESRAM, currentOffsetESRAM);
 
         /************************************************************************/
         // VSM Render Target
@@ -7502,47 +7678,6 @@ public:
         MSMRTDesc.pName = "MSM RT 1";
         addRenderTarget(pRenderer, &MSMRTDesc, &pRenderTargetMSM[1]);
 
-        /************************************************************************/
-        // Screen Space Shadow Map Render Target
-        /************************************************************************/
-        if (gSupportTextureAtomics)
-        {
-            TextureDesc SSSRTDesc = {};
-            SSSRTDesc.mWidth = mSettings.mWidth;
-            SSSRTDesc.mHeight = mSettings.mHeight;
-            SSSRTDesc.mDepth = 1;
-            SSSRTDesc.mArraySize = 1;
-            SSSRTDesc.mMipLevels = 1;
-            SSSRTDesc.mSampleCount = SAMPLE_COUNT_1;
-            SSSRTDesc.mFormat = TinyImageFormat_R32_UINT;
-            SSSRTDesc.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
-            SSSRTDesc.mClearValue.r = 1.0f;
-            SSSRTDesc.mClearValue.g = 1.0f;
-            SSSRTDesc.mClearValue.b = 1.0f;
-            SSSRTDesc.mClearValue.a = 1.0f;
-            SSSRTDesc.mDescriptors = DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE;
-            SSSRTDesc.pName = "Screen Space Shadows Texture";
-
-            TextureLoadDesc SSSTextureLoadDesc = {};
-            SSSTextureLoadDesc.pDesc = &SSSRTDesc;
-            SSSTextureLoadDesc.ppTexture = &pTextureSSS;
-            addResource(&SSSTextureLoadDesc, NULL);
-        }
-        else
-        {
-            BufferLoadDesc SSSRTDesc = {};
-            SSSRTDesc.mDesc.mDescriptors = DESCRIPTOR_TYPE_BUFFER | DESCRIPTOR_TYPE_RW_BUFFER;
-            SSSRTDesc.mDesc.mElementCount = mSettings.mWidth * mSettings.mHeight;
-            SSSRTDesc.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
-            SSSRTDesc.mDesc.mFlags = BUFFER_CREATION_FLAG_OWN_MEMORY_BIT;
-            SSSRTDesc.mDesc.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
-            SSSRTDesc.mDesc.mStructStride = sizeof(uint);
-            SSSRTDesc.mDesc.mSize = (uint64_t)SSSRTDesc.mDesc.mElementCount * SSSRTDesc.mDesc.mStructStride;
-            SSSRTDesc.mDesc.pName = "Screen Space Shadows Buffer";
-            SSSRTDesc.ppBuffer = &pBufferSSS;
-            addResource(&SSSRTDesc, NULL);
-        }
-
         /*************************************/
         // SDF mesh visualization render target
         /*************************************/
@@ -7555,12 +7690,13 @@ public:
                                                  ? TinyImageFormat_R32G32B32A32_SFLOAT
                                                  : TinyImageFormat_R16G16B16A16_SFLOAT;
         sdfMeshVisualizationRTDesc.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
-        sdfMeshVisualizationRTDesc.mWidth = mSettings.mWidth / SDF_SHADOW_DOWNSAMPLE_VALUE;
-        sdfMeshVisualizationRTDesc.mHeight = mSettings.mHeight / SDF_SHADOW_DOWNSAMPLE_VALUE;
+        sdfMeshVisualizationRTDesc.mWidth = sceneWidth / SDF_SHADOW_DOWNSAMPLE_VALUE;
+        sdfMeshVisualizationRTDesc.mHeight = sceneHeight / SDF_SHADOW_DOWNSAMPLE_VALUE;
         sdfMeshVisualizationRTDesc.mMipLevels = 1;
         sdfMeshVisualizationRTDesc.mSampleCount = SAMPLE_COUNT_1;
         sdfMeshVisualizationRTDesc.mSampleQuality = 0;
         sdfMeshVisualizationRTDesc.pName = "SDF Mesh Visualization RT";
+        sdfMeshVisualizationRTDesc.mFlags = TEXTURE_CREATION_FLAG_VR_MULTIVIEW;
         addRenderTarget(pRenderer, &sdfMeshVisualizationRTDesc, &pRenderTargetSDFMeshVisualization);
 
         TextureDesc sdfMeshShadowRTDesc = {};
@@ -7573,11 +7709,11 @@ public:
                                           : TinyImageFormat_R16G16_SFLOAT;
         sdfMeshShadowRTDesc.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
 #if ENABLE_SDF_SHADOW_DOWNSAMPLE
-        sdfMeshShadowRTDesc.mWidth = mSettings.mWidth / SDF_SHADOW_DOWNSAMPLE_VALUE;
-        sdfMeshShadowRTDesc.mHeight = mSettings.mHeight / SDF_SHADOW_DOWNSAMPLE_VALUE;
+        sdfMeshShadowRTDesc.mWidth = sceneWidth / SDF_SHADOW_DOWNSAMPLE_VALUE;
+        sdfMeshShadowRTDesc.mHeight = sceneHeight / SDF_SHADOW_DOWNSAMPLE_VALUE;
 #else
-        sdfMeshShadowRTDesc.mWidth = mSettings.mWidth;
-        sdfMeshShadowRTDesc.mHeight = mSettings.mHeight;
+        sdfMeshShadowRTDesc.mWidth = sceneWidth;
+        sdfMeshShadowRTDesc.mHeight = sceneHeight;
 #endif
         sdfMeshShadowRTDesc.mMipLevels = 1;
         sdfMeshShadowRTDesc.mSampleCount = SAMPLE_COUNT_1;
@@ -7595,8 +7731,8 @@ public:
         upSampleSDFShadowRTDesc.mDepth = 1;
         upSampleSDFShadowRTDesc.mFormat = TinyImageFormat_R16_SFLOAT;
         upSampleSDFShadowRTDesc.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
-        upSampleSDFShadowRTDesc.mWidth = mSettings.mWidth;
-        upSampleSDFShadowRTDesc.mHeight = mSettings.mHeight;
+        upSampleSDFShadowRTDesc.mWidth = sceneWidth;
+        upSampleSDFShadowRTDesc.mHeight = sceneHeight;
         upSampleSDFShadowRTDesc.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
         upSampleSDFShadowRTDesc.mMipLevels = 1;
         upSampleSDFShadowRTDesc.mSampleCount = SAMPLE_COUNT_1;
@@ -7604,6 +7740,7 @@ public:
         upSampleSDFShadowRTDesc.mFlags = TEXTURE_CREATION_FLAG_VR_MULTIVIEW;
         upSampleSDFShadowRTDesc.pName = "Upsample SDF Mesh Shadow";
         addRenderTarget(pRenderer, &upSampleSDFShadowRTDesc, &pRenderTargetUpSampleSDFShadow);
+
         /************************************************************************/
         // ASM Depth Pass Render Target
         /************************************************************************/
@@ -7650,11 +7787,11 @@ public:
         vbRTDesc.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
         vbRTDesc.mFormat = TinyImageFormat_R8G8B8A8_UNORM;
         vbRTDesc.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
-        vbRTDesc.mWidth = width;
-        vbRTDesc.mHeight = height;
+        vbRTDesc.mWidth = sceneWidth;
+        vbRTDesc.mHeight = sceneHeight;
         vbRTDesc.mSampleCount = gAppSettings.mMsaaLevel;
         vbRTDesc.mSampleQuality = 0;
-        vbRTDesc.mFlags = TEXTURE_CREATION_FLAG_ESRAM | TEXTURE_CREATION_FLAG_VR_MULTIVIEW;
+        vbRTDesc.mFlags = TEXTURE_CREATION_FLAG_VR_MULTIVIEW;
         vbRTDesc.pName = "VB RT";
         addRenderTarget(pRenderer, &vbRTDesc, &pRenderTargetVBPass);
         /************************************************************************/
@@ -7667,10 +7804,10 @@ public:
         msaaRTDesc.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
         msaaRTDesc.mFormat = pSwapChain->mFormat;
         msaaRTDesc.mStartState = RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        msaaRTDesc.mHeight = height;
+        msaaRTDesc.mHeight = sceneHeight;
         msaaRTDesc.mSampleCount = gAppSettings.mMsaaLevel;
         msaaRTDesc.mSampleQuality = 0;
-        msaaRTDesc.mWidth = width;
+        msaaRTDesc.mWidth = sceneWidth;
         msaaRTDesc.pName = "MSAA RT";
         // Disabling compression data will avoid decompression phase before resolve pass.
         // However, the shading pass will require more memory bandwidth.
@@ -7767,6 +7904,11 @@ public:
         setDesc = SRT_SET_DESC(BakedSDFMeshShadowSrtData, PerBatch, 1, 0);
         addDescriptorSet(pRenderer, &setDesc, &pDescriptorSetBakedSDFMeshShadow);
 
+#ifdef QUEST_VR
+        // Per dispatch SDF shadows set
+        setDesc = SRT_SET_DESC(BakedSDFMeshShadowSrtData, PerDraw, gDataBufferCount * VR_MULTIVIEW_COUNT, 0);
+        addDescriptorSet(pRenderer, &setDesc, &pDescriptorSetSDFShadowPerDraw);
+#endif
         /// update region 3d texture
         setDesc = SRT_SET_DESC(UpdateRegion3DTextureSrtData, PerBatch, 1, 0);
         addDescriptorSet(pRenderer, &setDesc, &pDescriptorSetUpdateRegion3DTexture);
@@ -7792,15 +7934,17 @@ public:
         addDescriptorSet(pRenderer, &setDesc, &pDescriptorSetDisplayPerDraw);
 
         // SSS
-        setDesc = SRT_SET_DESC(ScreenSpaceShadowsSrtData, PerBatch, gDataBufferCount, 0);
+        setDesc = SRT_SET_DESC(ScreenSpaceShadowsSrtData, PerBatch, gDataBufferCount * VR_MULTIVIEW_COUNT, 0);
         addDescriptorSet(pRenderer, &setDesc, &pDescriptorSetSSSPerBatch);
         setDesc = SRT_SET_DESC(ScreenSpaceShadowsSrtData, PerDraw, gDataBufferCount * MAX_SSS_WAVE_OFFSETS, 0);
         addDescriptorSet(pRenderer, &setDesc, &pDescriptorSetSSSPerDraw);
 
         // ASM Depth, VB Pass
-        setDesc = SRT_SET_DESC(VisibilityBufferPassSrtData, PerDraw, gDataBufferCount * 2, 0);
+        setDesc = SRT_SET_DESC(VisibilityBufferPassSrtData, PerDraw, gDataBufferCount, 0);
         addDescriptorSet(pRenderer, &setDesc, &pDescriptorSetVBPass);
-        setDesc = SRT_SET_DESC(VisibilityBufferPassSrtData, PerDraw, gDataBufferCount * ASM_MAX_TILES_PER_PASS, 0);
+        setDesc = SRT_SET_DESC(VisibilityBufferShadowPassSrtData, PerDraw, gDataBufferCount, 0);
+        addDescriptorSet(pRenderer, &setDesc, &pDescriptorSetDepthVBPass);
+        setDesc = SRT_SET_DESC(VisibilityBufferShadowPassSrtData, PerDraw, gDataBufferCount * ASM_MAX_TILES_PER_PASS, 0);
         addDescriptorSet(pRenderer, &setDesc, &pDescriptorSetASMDepthPass);
         // ASM indirection
         setDesc = SRT_SET_DESC(QuadDataSrtData, PerDraw, gDataBufferCount * (gs_ASMMaxRefinement + 1), 0);
@@ -7860,6 +8004,9 @@ public:
         removeDescriptorSet(pRenderer, pDescriptorSetAsmLodClamp);
         removeDescriptorSet(pRenderer, pDescriptorSetAsmClearIndirection);
         removeDescriptorSet(pRenderer, pDescriptorSetBakedSDFMeshShadow);
+#ifdef QUEST_VR
+        removeDescriptorSet(pRenderer, pDescriptorSetSDFShadowPerDraw);
+#endif
         removeDescriptorSet(pRenderer, pDescriptorSetSSSPerDraw);
         removeDescriptorSet(pRenderer, pDescriptorSetSSSPerBatch);
         removeDescriptorSet(pRenderer, pDescriptorSetPersistent);
@@ -7871,6 +8018,7 @@ public:
         removeDescriptorSet(pRenderer, pDescriptorSetGaussianBlurPerBatch);
         removeDescriptorSet(pRenderer, pDescriptorSetUpdateRegion3DTexture);
         removeDescriptorSet(pRenderer, pDescriptorSetVBPass);
+        removeDescriptorSet(pRenderer, pDescriptorSetDepthVBPass);
         removeDescriptorSet(pRenderer, pDescriptorSetASMDepthPass);
         removeDescriptorSet(pRenderer, pDescriptorSetASMFillIndirection[0]);
         removeDescriptorSet(pRenderer, pDescriptorSetASMFillIndirection[1]);
@@ -7987,6 +8135,19 @@ public:
             bakedSdfShadowSetParams[1].ppTextures = &pRenderTargetSDFMeshVisualization->pTexture;
             updateDescriptorSet(pRenderer, 0, pDescriptorSetBakedSDFMeshShadow, 2, bakedSdfShadowSetParams);
 
+#ifdef QUEST_VR
+            for (uint32_t i = 0; i < gDataBufferCount; ++i)
+            {
+                for (uint32_t viewIndex = 0; viewIndex < VR_MULTIVIEW_COUNT; ++viewIndex)
+                {
+                    DescriptorData perDrawSDFShadowParams[1] = {};
+                    const uint32_t descriptorIndex = i * VR_MULTIVIEW_COUNT + viewIndex;
+                    perDrawSDFShadowParams[0].mIndex = SRT_RES_IDX(BakedSDFMeshShadowSrtData, PerDraw, gPerDrawSDFData);
+                    perDrawSDFShadowParams[0].ppBuffers = &pBufferSDFPerDraw[descriptorIndex];
+                    updateDescriptorSet(pRenderer, descriptorIndex, pDescriptorSetSDFShadowPerDraw, 1, perDrawSDFShadowParams);
+                }
+            }
+#endif
             // update region 3d texture
             DescriptorData updateRegion3DTextureSetParams[1] = {};
             updateRegion3DTextureSetParams[0].mIndex = SRT_RES_IDX(UpdateRegion3DTextureSrtData, PerBatch, gSDFVolumeTextureAtlasRW);
@@ -8106,15 +8267,15 @@ public:
                 DescriptorData objectParams[1] = {};
                 objectParams[0].mIndex = SRT_RES_IDX(VisibilityBufferPassSrtData, PerDraw, gObjectUniformBlockPerDraw);
                 objectParams[0].ppBuffers = &pBufferMeshTransforms[0][i];
-                updateDescriptorSet(pRenderer, i * 2 + 0, pDescriptorSetVBPass, 1, objectParams);
+                updateDescriptorSet(pRenderer, i, pDescriptorSetVBPass, 1, objectParams);
 
-                objectParams[0].mIndex = SRT_RES_IDX(VisibilityBufferPassSrtData, PerDraw, gObjectUniformBlockPerDraw);
+                objectParams[0].mIndex = SRT_RES_IDX(VisibilityBufferShadowPassSrtData, PerDraw, gObjectUniformBlockPerDraw);
                 objectParams[0].ppBuffers = &pBufferMeshShadowProjectionTransforms[0][0][i];
-                updateDescriptorSet(pRenderer, i * 2 + 1, pDescriptorSetVBPass, 1, objectParams);
+                updateDescriptorSet(pRenderer, i, pDescriptorSetDepthVBPass, 1, objectParams);
 
                 for (int j = 0; j < ASM_MAX_TILES_PER_PASS; j++)
                 {
-                    objectParams[0].mIndex = SRT_RES_IDX(VisibilityBufferPassSrtData, PerDraw, gObjectUniformBlockPerDraw);
+                    objectParams[0].mIndex = SRT_RES_IDX(VisibilityBufferShadowPassSrtData, PerDraw, gObjectUniformBlockPerDraw);
                     objectParams[0].ppBuffers = &pBufferMeshShadowProjectionTransforms[0][j][i];
                     updateDescriptorSet(pRenderer, i + j * gDataBufferCount, pDescriptorSetASMDepthPass, 1, objectParams);
                 }
@@ -8176,29 +8337,32 @@ public:
         // Screen Space Shadow Mapping
         {
             DescriptorData params[2] = {};
-            for (uint32_t i = 0; i < gDataBufferCount; i++)
+            for (uint32_t viewIndex = 0; viewIndex < VR_MULTIVIEW_COUNT; viewIndex++)
             {
-                params[0].mIndex = SRT_RES_IDX(ScreenSpaceShadowsSrtData, PerBatch, gSSSUniform);
-                params[0].ppBuffers = &pBufferSSSUniform[i];
-                params[0].mCount = 1;
-                params[1].mIndex = SRT_RES_IDX(ScreenSpaceShadowsSrtData, PerBatch, gOutputTexture);
-                params[1].mCount = 1;
-                if (gSupportTextureAtomics)
+                for (uint32_t i = 0; i < gDataBufferCount; i++)
                 {
-                    params[1].ppTextures = &pTextureSSS;
-                }
-                else
-                {
-                    params[1].ppBuffers = &pBufferSSS;
-                }
-                updateDescriptorSet(pRenderer, i, pDescriptorSetSSSPerBatch, 2, params);
-
-                for (uint32_t k = 0; k < MAX_SSS_WAVE_OFFSETS; k++)
-                {
-                    params[0].mIndex = SRT_RES_IDX(ScreenSpaceShadowsSrtData, PerDraw, gSSSWaveOffsets);
-                    params[0].ppBuffers = &pBufferSSSWaveOffsets[k][i];
+                    params[0].mIndex = SRT_RES_IDX(ScreenSpaceShadowsSrtData, PerBatch, gSSSUniform);
+                    params[0].ppBuffers = &pBufferSSSUniform[viewIndex][i];
                     params[0].mCount = 1;
-                    updateDescriptorSet(pRenderer, i * MAX_SSS_WAVE_OFFSETS + k, pDescriptorSetSSSPerDraw, 1, params);
+                    params[1].mIndex = SRT_RES_IDX(ScreenSpaceShadowsSrtData, PerBatch, gOutputTexture);
+                    params[1].mCount = 1;
+                    if (gSupportTextureAtomics)
+                    {
+                        params[1].ppTextures = &pTextureSSS;
+                    }
+                    else
+                    {
+                        params[1].ppBuffers = &pBufferSSS;
+                    }
+                    updateDescriptorSet(pRenderer, viewIndex * gDataBufferCount + i, pDescriptorSetSSSPerBatch, 2, params);
+
+                    for (uint32_t k = 0; k < MAX_SSS_WAVE_OFFSETS; k++)
+                    {
+                        params[0].mIndex = SRT_RES_IDX(ScreenSpaceShadowsSrtData, PerDraw, gSSSWaveOffsets);
+                        params[0].ppBuffers = &pBufferSSSWaveOffsets[k][i];
+                        params[0].mCount = 1;
+                        updateDescriptorSet(pRenderer, i * MAX_SSS_WAVE_OFFSETS + k, pDescriptorSetSSSPerDraw, 1, params);
+                    }
                 }
             }
         }
@@ -8589,7 +8753,7 @@ public:
             initExtendedGraphicsShaderLimits(&edescs[0].shaderLimitsDesc);
             edescs[0].shaderLimitsDesc.maxWavesWithLateAllocParameterCache = 16;
 
-            edescs[1].type = EXTENDED_GRAPHICS_PIPELINE_TYPE_DEPTH_STENCIL_OPTIONS;
+            edescs[1].type = EXTENDED_GRAPHICS_PIPELINE_TYPE_PIXEL_SHADER_OPTIONS;
             edescs[1].pixelShaderOptions.outOfOrderRasterization = PIXEL_SHADER_OPTION_OUT_OF_ORDER_RASTERIZATION_ENABLE_WATER_MARK_7;
             edescs[1].pixelShaderOptions.depthBeforeShader =
                 !i ? PIXEL_SHADER_OPTION_DEPTH_BEFORE_SHADER_ENABLE : PIXEL_SHADER_OPTION_DEPTH_BEFORE_SHADER_DEFAULT;
@@ -8633,7 +8797,7 @@ public:
         initExtendedGraphicsShaderLimits(&edescs[0].shaderLimitsDesc);
         // edescs[0].ShaderLimitsDesc.MaxWavesWithLateAllocParameterCache = 22;
 
-        edescs[1].type = EXTENDED_GRAPHICS_PIPELINE_TYPE_DEPTH_STENCIL_OPTIONS;
+        edescs[1].type = EXTENDED_GRAPHICS_PIPELINE_TYPE_PIXEL_SHADER_OPTIONS;
         edescs[1].pixelShaderOptions.outOfOrderRasterization = PIXEL_SHADER_OPTION_OUT_OF_ORDER_RASTERIZATION_ENABLE_WATER_MARK_7;
         edescs[1].pixelShaderOptions.depthBeforeShader = PIXEL_SHADER_OPTION_DEPTH_BEFORE_SHADER_ENABLE;
 
@@ -8690,7 +8854,12 @@ public:
         desc.mComputeDesc = {};
         PIPELINE_LAYOUT_DESC(desc, SRT_LAYOUT_DESC(BakedSDFMeshShadowSrtData, Persistent),
                              SRT_LAYOUT_DESC(BakedSDFMeshShadowSrtData, PerFrame), SRT_LAYOUT_DESC(BakedSDFMeshShadowSrtData, PerBatch),
-                             NULL);
+#ifdef QUEST_VR
+                             SRT_LAYOUT_DESC(BakedSDFMeshShadowSrtData, PerDraw)
+#else
+                             NULL
+#endif
+        );
         ComputePipelineDesc& sdfMeshVisualizationDesc = desc.mComputeDesc;
         sdfMeshVisualizationDesc.pShaderProgram = pShaderSDFMeshVisualization[gAppSettings.mMsaaIndex];
         addPipeline(pRenderer, &desc, &pPipelineSDFMeshVisualization);
@@ -8698,7 +8867,12 @@ public:
         desc.mComputeDesc = {};
         PIPELINE_LAYOUT_DESC(desc, SRT_LAYOUT_DESC(BakedSDFMeshShadowSrtData, Persistent),
                              SRT_LAYOUT_DESC(BakedSDFMeshShadowSrtData, PerFrame), SRT_LAYOUT_DESC(BakedSDFMeshShadowSrtData, PerBatch),
-                             NULL);
+#ifdef QUEST_VR
+                             SRT_LAYOUT_DESC(BakedSDFMeshShadowSrtData, PerDraw)
+#else
+                             NULL
+#endif
+        );
         ComputePipelineDesc& sdfMeshShadowDesc = desc.mComputeDesc;
         sdfMeshShadowDesc.pShaderProgram = pShaderSDFMeshShadow[gAppSettings.mMsaaIndex];
         addPipeline(pRenderer, &desc, &pPipelineSDFMeshShadow);
@@ -8755,9 +8929,9 @@ public:
         // Setup the resources needed for Sdf box
         /************************************************************************/
         desc.mGraphicsDesc = {};
-        PIPELINE_LAYOUT_DESC(desc, SRT_LAYOUT_DESC(VisibilityBufferPassSrtData, Persistent),
-                             SRT_LAYOUT_DESC(VisibilityBufferPassSrtData, PerFrame), NULL,
-                             SRT_LAYOUT_DESC(VisibilityBufferPassSrtData, PerDraw));
+        PIPELINE_LAYOUT_DESC(desc, SRT_LAYOUT_DESC(VisibilityBufferShadowPassSrtData, Persistent),
+                             SRT_LAYOUT_DESC(VisibilityBufferShadowPassSrtData, PerFrame), NULL,
+                             SRT_LAYOUT_DESC(VisibilityBufferShadowPassSrtData, PerDraw));
         GraphicsPipelineDesc& ASMIndirectDepthPassPipelineDesc = desc.mGraphicsDesc;
         ASMIndirectDepthPassPipelineDesc.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
         ASMIndirectDepthPassPipelineDesc.mRenderTargetCount = 0;

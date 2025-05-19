@@ -41,9 +41,9 @@ public:
     }
     void setMotionParameters(const CameraMotionParameters&) override;
 
-    mat4 getViewMatrix() const override;
-    vec3 getViewPosition() const override;
-    vec2 getRotationXY() const override { return viewRotation; }
+    CameraMatrix getViewMatrix() const override;
+    vec3         getViewPosition() const override;
+    vec2         getRotationXY() const override { return viewRotation; }
 
     void moveTo(const vec3& location) override;
     void lookAt(const vec3& lookAt) override;
@@ -171,8 +171,9 @@ void FpsCameraController::update(float deltaTime)
 
     // create rotation matrix
     mat4 vrRotation = mat4::identity();
+
 #if defined(QUEST_VR)
-    vrRotation.setUpper3x3(inverse(pQuest->mViewMatrix.getUpper3x3()));
+    vrRotation.setUpper3x3(inverse(mat4::identity().getUpper3x3()));
     viewRotation.setX(0.0f); // No rotation around the x axis when using vr
 #endif
     mat4 rot = mat4::rotationYX(viewRotation.getY(), viewRotation.getX()) * vrRotation;
@@ -195,17 +196,27 @@ void FpsCameraController::update(float deltaTime)
     dz = 0.0f;
 }
 
-mat4 FpsCameraController::getViewMatrix() const
+CameraMatrix FpsCameraController::getViewMatrix() const
 {
-    mat4 r = mat4::rotationXY(-viewRotation.getX(), -viewRotation.getY());
-#if defined(QUEST_VR)
-    mat4 vrViewMat = pQuest->mViewMatrix;
-    vrViewMat.setTranslation(vec3(0.0f));
-    r = vrViewMat * r;
-#endif
+    CameraMatrix result;
+    mat4         r = mat4::rotationXY(-viewRotation.getX(), -viewRotation.getY());
+
+#if !defined(QUEST_VR)
+    result.mCamera = r;
     vec4 t = r * vec4(-viewPosition, 1.0f);
-    r.setTranslation(t.getXYZ());
-    return r;
+    result.mCamera.setTranslation(t.getXYZ());
+#else
+    GetOpenXRViewMatrix(LEFT_EYE_VIEW, &result.mLeftEye);
+    GetOpenXRViewMatrix(RIGHT_EYE_VIEW, &result.mRightEye);
+    result.mLeftEye = result.mLeftEye * r;
+    result.mRightEye = result.mRightEye * r;
+    vec4 tLeft = result.mLeftEye * vec4(-viewPosition, 1.0f);
+    vec4 tRight = result.mRightEye * vec4(-viewPosition, 1.0f);
+    result.mLeftEye.setTranslation(tLeft.getXYZ());
+    result.mRightEye.setTranslation(tRight.getXYZ());
+#endif // QUEST_VR
+
+    return result;
 }
 
 vec3 FpsCameraController::getViewPosition() const { return viewPosition; }
@@ -247,12 +258,13 @@ public:
         velocity = vec3{ 0 };
     }
 
-    mat4 getViewMatrix() const override
+    CameraMatrix getViewMatrix() const override
     {
-        mat4 r{ mat4::rotationXY(-viewRotation.getX(), -viewRotation.getY()) };
-        vec4 t = r * vec4(-viewPosition, 1.0f);
-        r.setTranslation(t.getXYZ());
-        return r;
+        CameraMatrix result;
+        result.mCamera = mat4::rotationXY(-viewRotation.getX(), -viewRotation.getY());
+        vec4 t = result.mCamera * vec4(-viewPosition, 1.0f);
+        result.mCamera.setTranslation(t.getXYZ());
+        return result;
     }
 
     vec3 getViewPosition() const override { return viewPosition; }
@@ -338,12 +350,21 @@ void CameraMatrix::applyProjectionSampleOffset(float xOffset, float yOffset)
 #endif
 }
 
+void CameraMatrix::setTranslation(const vec3& translation)
+{
+    mLeftEye.setTranslation(translation);
+#if defined(QUEST_VR)
+    mRightEye.setTranslation(translation);
+#endif // QUEST_VR
+}
+
 bool loadCameraPath(const char* pFileName, uint32_t& outNumCameraPoints, float3** pOutCameraPoints)
 {
     FileStream fh = {};
     if (!fsOpenStreamFromPath(RD_OTHER_FILES, pFileName, FM_READ, &fh))
     {
-        LOGF(LogLevel::eERROR, "Failed to open the camera path file");
+        LOGF(LogLevel::eERROR, "Failed to open the camera path file. Function %s failed with error: %s", FS_ERR_CTX.func,
+             getFSErrCodeString(FS_ERR_CTX.code));
         return false;
     }
 

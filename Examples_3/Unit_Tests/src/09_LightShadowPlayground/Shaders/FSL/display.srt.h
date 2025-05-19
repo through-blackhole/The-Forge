@@ -26,10 +26,14 @@
 #define display_srt_h
 
 BEGIN_SRT(DisplaySrtData)
-	#include "persistent_set.h"
-	#include "perframe_set.h"
+	#include "PersistentSet.h"
+	#include "PerFrameSet.h"
 BEGIN_SRT_SET(PerDraw)
+#if FT_MULTIVIEW
+	DECL_TEXTURE(PerDraw, Tex2DArray(float4), gSourceTexture)
+#else
 	DECL_TEXTURE(PerDraw, Tex2D(float4), gSourceTexture)
+#endif /*FT_MULTIVIEW*/
 END_SRT_SET(PerDraw)
 END_SRT(DisplaySrtData)
 

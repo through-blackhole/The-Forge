@@ -53,7 +53,7 @@
 
 // fsl
 #include "../../../../Common_3/Graphics/FSL/defaults.h"
-#include "./Shaders/FSL/srt.h"
+#include "./Shaders/FSL/Global.srt.h"
 
 // startdust hash function, use this to generate all the seed and update the position of all particles
 #define RND_GEN(x)                  ((x) = (x)*196314165 + 907633515)
@@ -271,7 +271,7 @@ public:
         // check for init success
         if (!pRenderer)
         {
-            ShowUnsupportedMessage("Failed To Initialize renderer!");
+            ShowUnsupportedMessage(getUnsupportedGPUMsg());
             return false;
         }
         setupGPUConfigurationPlatformParameters(pRenderer, settings.pExtendedSettings);
@@ -706,8 +706,8 @@ public:
         // Compute matrices
         /************************************************************************/
         // update camera with time
-        mat4 modelMat = mat4::rotationX(gObjSettings.mRotX) * mat4::rotationY(gObjSettings.mRotY);
-        mat4 viewMat = pCameraController->getViewMatrix();
+        mat4         modelMat = mat4::rotationX(gObjSettings.mRotX) * mat4::rotationY(gObjSettings.mRotY);
+        CameraMatrix viewMat = pCameraController->getViewMatrix();
 
         const float  aspectInverse = (float)mSettings.mHeight / (float)mSettings.mWidth;
         const float  horizontal_fov = PI / 2.0f;

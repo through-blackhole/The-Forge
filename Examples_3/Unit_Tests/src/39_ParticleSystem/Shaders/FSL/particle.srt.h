@@ -26,13 +26,13 @@
 #define particle_srt_h
 
 BEGIN_SRT(ParticleSrtData)
-#include "persistent_set.h"
-#include "perframe_set.h"
+#include "PersistentSet.h"
+#include "PerFrameSet.h"
 	BEGIN_SRT_SET(PerBatch)
 		DECL_RWBUFFER(PerBatch, RWBuffer(uint), gParticleSetVisibilityRW)
 		DECL_RWBUFFER(PerBatch, RWBuffer(PackedParticleTransparencyNode), gTransparencyListRW)
 		DECL_RWBUFFER(PerBatch, RWBuffer(ParticleBufferStateData), gParticleBufferStateRW)
-        DECL_RWBUFFER(PerBatch, RWBuffer(ParticleData), gParticlesDataBufferRW)
+        DECL_RWBUFFER(PerBatch, RWByteBuffer, gParticlesDataBufferRW)
         DECL_RWBUFFER(PerBatch, RWBuffer(uint), gParticlesToRasterizeRW)
         DECL_RWBUFFER(PerBatch, RWBuffer(uint), gParticleRenderIndirectDataRW)
         DECL_RWBUFFER(PerBatch, RWBuffer(uint), gBitfieldBufferRW)

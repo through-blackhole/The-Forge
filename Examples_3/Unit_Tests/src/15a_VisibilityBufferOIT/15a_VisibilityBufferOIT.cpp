@@ -54,16 +54,16 @@
 
 #define NO_FSL_DEFINITIONS
 #include "../../../../Common_3/Graphics/FSL/fsl_srt.h"
-#include "Shaders/FSL/shader_defs.h.fsl"
+#include "Shaders/FSL/ShaderDefs.h.fsl"
 #include "../../../../Common_3/Graphics/FSL/defaults.h"
-#include "./Shaders/FSL/display.srt.h"
-#include "./Shaders/FSL/godray_blur.comp.srt.h"
-#include "./Shaders/FSL/pre_skin_vertexes.comp.srt.h"
-#include "./Shaders/FSL/visibilityBuffer_pass_transparent.srt.h"
-#include "./Shaders/FSL/srt.h"
-#include "./Shaders/FSL/resolveVRS.srt.h"
-#include "./Shaders/FSL/cluster_lights.srt.h"
-#include "./Shaders/FSL/triangle_filtering.srt.h"
+#include "./Shaders/FSL/Display.srt.h"
+#include "./Shaders/FSL/GodrayBlur.srt.h"
+#include "./Shaders/FSL/PreSkinVertexes.srt.h"
+#include "./Shaders/FSL/VisibilityBufferPassTransparent.srt.h"
+#include "./Shaders/FSL/Global.srt.h"
+#include "./Shaders/FSL/ResolveVRS.srt.h"
+#include "./Shaders/FSL/LightClusters.srt.h"
+#include "./Shaders/FSL/TriangleFiltering.srt.h"
 
 #include "../../../../Common_3/Utilities/Interfaces/IMemory.h"
 
@@ -646,6 +646,12 @@ Buffer* pGeometryCountBufferOIT = NULL;
 Buffer* pHeadIndexBufferOIT = NULL;
 Buffer* pVisBufLinkedListBufferOIT = NULL;
 
+// We are rendering the scene (geometry, skybox, ...) at this resolution, UI at window resolution (mSettings.mWidth, mSettings.mHeight)
+// Render scene at gSceneRes
+// presentImage -> The scene rendertarget composed into the swapchain/backbuffer
+// Render UI into backbuffer
+static Resolution gSceneRes;
+
 /************************************************************************/
 // Screen resolution UI data
 /************************************************************************/
@@ -706,20 +712,6 @@ void        RunScript(void* pUserData)
     luaQueueScriptToRun(&runDesc);
 }
 
-// LIMIT RESOLUTION FOR THIS EXAMPLE
-//
-#if defined(NX64)
-#define RES_LIMIT_WIDTH  1280
-#define RES_LIMIT_HEIGHT 720
-#elif defined(ANDROID)
-// #TODO: Solve this properly with correct upscaling, ...
-#define RES_LIMIT_WIDTH 1024
-#else
-#define RES_LIMIT_WIDTH 16384
-#endif
-static uint32_t gSceneWidth = 0;
-static uint32_t gSceneHeight = 0;
-
 class VisibilityBufferOIT: public IApp
 {
 public:
@@ -752,27 +744,17 @@ public:
         // check for init success
         if (!pRenderer)
         {
-            ShowUnsupportedMessage("Failed To Initialize renderer!");
+            ShowUnsupportedMessage(getUnsupportedGPUMsg());
             return false;
         }
         setupGPUConfigurationPlatformParameters(pRenderer, settings.pExtendedSettings);
 
-        if (!gGpuSettings.mBindlessSupported)
-        {
-            ShowUnsupportedMessage("Visibility Buffer does not run on this device. GPU does not support enough bindless texture entries");
-            return false;
-        }
-
-        if (!pRenderer->pGpu->mPrimitiveIdSupported)
-        {
-            ShowUnsupportedMessage("Visibility Buffer does not run on this device. PrimitiveID is not supported");
-            return false;
-        }
-
         // turn off by default depending on gpu config rules
         gAppSettings.mEnableVRS &= pRenderer->pGpu->mSoftwareVRSSupported && (gGpuSettings.mMSAASampleCount >= SAMPLE_COUNT_4);
         gAppSettings.mEnableGodray &= !gGpuSettings.mDisableGodRays;
-        gAppSettings.mMsaaLevel = gAppSettings.mEnableVRS ? SAMPLE_COUNT_4 : (SampleCount)min(1u, gGpuSettings.mMSAASampleCount);
+        gAppSettings.mMsaaLevel =
+            gAppSettings.mEnableVRS ? SAMPLE_COUNT_4
+                                    : (SampleCount)clamp(gGpuSettings.mMSAASampleCount, (uint32_t)SAMPLE_COUNT_1, (uint32_t)SAMPLE_COUNT_4);
         gAppSettings.mMsaaIndex = (uint32_t)log2((uint32_t)gAppSettings.mMsaaLevel);
         gAppSettings.mMsaaIndexRequested = gAppSettings.mMsaaIndex;
 #if defined(ENABLE_WORKGRAPH)
@@ -1443,18 +1425,7 @@ public:
     // loaded later by the shade step to reconstruct interpolated triangle data per pixel.
     bool Load(ReloadDesc* pReloadDesc)
     {
-        if (mSettings.mWidth > RES_LIMIT_WIDTH)
-        {
-            float aspect = (float)mSettings.mHeight / mSettings.mWidth;
-            gSceneWidth = RES_LIMIT_WIDTH;
-            gSceneHeight = (uint32_t)(gSceneWidth * aspect);
-        }
-        else
-        {
-            gSceneWidth = mSettings.mWidth;
-            gSceneHeight = mSettings.mHeight;
-        }
-
+        gSceneRes = getGPUCfgSceneResolution(mSettings.mWidth, mSettings.mHeight);
         gFrameCount = 0;
 
         if (pReloadDesc->mType & RELOAD_TYPE_SHADER)
@@ -1559,25 +1530,6 @@ public:
 
             luaRegisterWidget(
                 uiAddComponentWidget(pGuiWindow, "Transparent Alphas", &collapsingAlphaControlOptions, WIDGET_TYPE_COLLAPSING_HEADER));
-
-            if (gAppSettings.mMsaaIndex != gAppSettings.mMsaaIndexRequested)
-            {
-                gAppSettings.mMsaaIndex = gAppSettings.mMsaaIndexRequested;
-                gAppSettings.mMsaaLevel = (SampleCount)(1 << gAppSettings.mMsaaIndex);
-                while (gAppSettings.mMsaaIndex > 0)
-                {
-                    if ((pRenderer->pGpu->mFrameBufferSamplesCount & gAppSettings.mMsaaLevel) == 0)
-                    {
-                        gAppSettings.mMsaaIndex--;
-                        gAppSettings.mMsaaLevel = (SampleCount)(gAppSettings.mMsaaLevel / 2);
-                    }
-                    else
-                    {
-                        break;
-                    }
-                }
-            }
-            gDivider = gAppSettings.mEnableVRS ? 2 : 1;
 
             static const char* msaaSampleNames[] = { "Off", "2 Samples", "4 Samples" };
 
@@ -1775,12 +1727,34 @@ public:
 
             if (!addSwapChain())
                 return false;
+        }
+
+        if (pReloadDesc->mType & (RELOAD_TYPE_RESIZE | RELOAD_TYPE_RENDERTARGET | RELOAD_TYPE_SCENE_RESOLUTION))
+        {
+            if (gAppSettings.mMsaaIndex != gAppSettings.mMsaaIndexRequested)
+            {
+                gAppSettings.mMsaaIndex = gAppSettings.mMsaaIndexRequested;
+                gAppSettings.mMsaaLevel = (SampleCount)(1 << gAppSettings.mMsaaIndex);
+                while (gAppSettings.mMsaaIndex > 0)
+                {
+                    if ((pRenderer->pGpu->mFrameBufferSamplesCount & gAppSettings.mMsaaLevel) == 0)
+                    {
+                        gAppSettings.mMsaaIndex--;
+                        gAppSettings.mMsaaLevel = (SampleCount)(gAppSettings.mMsaaLevel / 2);
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+            }
+            gDivider = gAppSettings.mEnableVRS ? 2 : 1;
 
             addRenderTargets();
 
             SetupDebugTexturesWindow();
 
-            if (pReloadDesc->mType & RELOAD_TYPE_RESIZE)
+            if (pReloadDesc->mType & (RELOAD_TYPE_RESIZE | RELOAD_TYPE_SCENE_RESOLUTION))
             {
                 addOrderIndependentTransparencyResources();
             }
@@ -1793,20 +1767,15 @@ public:
         waitForAllResourceLoads();
         prepareDescriptorSets();
 
-        const uint32_t width = gSceneWidth;
-        const uint32_t height = gSceneHeight;
-
         UserInterfaceLoadDesc uiLoad = {};
-        uiLoad.mColorFormat = gAppSettings.mEnableVRS ? pResolveVRSRenderTarget[0]->mFormat : pIntermediateRenderTarget->mFormat;
-        uiLoad.mDisplayHeight = mSettings.mHeight;
-        uiLoad.mDisplayWidth = mSettings.mWidth;
-        uiLoad.mHeight = height;
-        uiLoad.mWidth = width;
+        uiLoad.mColorFormat = pSwapChain->ppRenderTargets[0]->mFormat;
+        uiLoad.mHeight = mSettings.mHeight;
+        uiLoad.mWidth = mSettings.mWidth;
         uiLoad.mLoadType = pReloadDesc->mType;
         loadUserInterface(&uiLoad);
 
         FontSystemLoadDesc fontLoad = {};
-        fontLoad.mColorFormat = gAppSettings.mEnableVRS ? pResolveVRSRenderTarget[0]->mFormat : pIntermediateRenderTarget->mFormat;
+        fontLoad.mColorFormat = pSwapChain->ppRenderTargets[0]->mFormat;
         fontLoad.mHeight = mSettings.mHeight;
         fontLoad.mWidth = mSettings.mWidth;
         fontLoad.mLoadType = pReloadDesc->mType;
@@ -1828,9 +1797,8 @@ public:
             removePipelines();
         }
 
-        if (pReloadDesc->mType & (RELOAD_TYPE_RESIZE | RELOAD_TYPE_RENDERTARGET))
+        if (pReloadDesc->mType & (RELOAD_TYPE_RESIZE | RELOAD_TYPE_RENDERTARGET | RELOAD_TYPE_SCENE_RESOLUTION))
         {
-            removeSwapChain(pRenderer, pSwapChain);
             removeRenderTargets();
 
             if (pDebugTexturesWindow)
@@ -1839,12 +1807,17 @@ public:
                 pDebugTexturesWindow = NULL;
             }
 
-            if (pReloadDesc->mType & RELOAD_TYPE_RESIZE)
+            if (pReloadDesc->mType & (RELOAD_TYPE_RESIZE | RELOAD_TYPE_SCENE_RESOLUTION))
             {
                 removeOrderIndependentTransparencyResources();
 
                 ESRAM_RESET_ALLOCS(pRenderer);
             }
+        }
+
+        if (pReloadDesc->mType & (RELOAD_TYPE_RESIZE | RELOAD_TYPE_RENDERTARGET))
+        {
+            removeSwapChain(pRenderer, pSwapChain);
 
             uiRemoveComponent(pHistogramWindow);
             uiRemoveComponent(pGuiWindow);
@@ -2303,7 +2276,7 @@ public:
                 if (gAppSettings.mEnableVRS)
                 {
                     cmdBeginGpuTimestampQuery(graphicsCmd, gGraphicsProfileToken, "VRS Resolve Pass");
-                    pScreenRenderTarget = pResolveVRSRenderTarget[1 - frameIdx];
+                    pScreenRenderTarget = pResolveVRSRenderTarget[frameIdx];
                     RenderTargetBarrier barriers[] = {
                         { pRenderTargetMSAA, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE },
                         { pIntermediateRenderTarget, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_PIXEL_SHADER_RESOURCE },
@@ -2314,10 +2287,10 @@ public:
 
                     cmdBindPipeline(graphicsCmd, pPipelineResolveCompute);
                     cmdBindDescriptorSet(graphicsCmd, 1 - frameIdx, pDescriptorSetResolveVRSPerBatch);
-                    cmdBindDescriptorSet(graphicsCmd, 1 - frameIdx, pDescriptorSetPerFrame);
+                    cmdBindDescriptorSet(graphicsCmd, frameIdx, pDescriptorSetPerFrame);
                     const uint32_t* pThreadGroupSize = pShaderResolveCompute->mNumThreadsPerGroup;
-                    cmdDispatch(graphicsCmd, mSettings.mWidth / (gDivider * pThreadGroupSize[0]) + 1,
-                                mSettings.mHeight / (gDivider * pThreadGroupSize[1]) + 1, pThreadGroupSize[2]);
+                    cmdDispatch(graphicsCmd, gSceneRes.mWidth / (gDivider * pThreadGroupSize[0]) + 1,
+                                gSceneRes.mHeight / (gDivider * pThreadGroupSize[1]) + 1, pThreadGroupSize[2]);
 
                     cmdEndGpuTimestampQuery(graphicsCmd, gGraphicsProfileToken);
 
@@ -2354,13 +2327,17 @@ public:
 
             cmdResourceBarrier(graphicsCmd, barrierCount, barriers2, 0, NULL, 0, NULL);
 
-            cmdBeginGpuTimestampQuery(graphicsCmd, gGraphicsProfileToken, "UI Pass");
-            drawGUI(graphicsCmd, frameIdx);
-            cmdEndGpuTimestampQuery(graphicsCmd, gGraphicsProfileToken);
-
             // Get the current render target for this frame
             acquireNextImage(pRenderer, pSwapChain, pImageAcquiredSemaphore, NULL, &presentIndex);
             presentImage(graphicsCmd, pScreenRenderTarget, pSwapChain->ppRenderTargets[presentIndex], frameIdx);
+
+            cmdBeginGpuTimestampQuery(graphicsCmd, gGraphicsProfileToken, "UI Pass");
+            drawGUI(graphicsCmd, presentIndex);
+            cmdEndGpuTimestampQuery(graphicsCmd, gGraphicsProfileToken);
+
+            RenderTargetBarrier barrierPresent = { pSwapChain->ppRenderTargets[presentIndex], RESOURCE_STATE_RENDER_TARGET,
+                                                   RESOURCE_STATE_PRESENT };
+            cmdResourceBarrier(graphicsCmd, 0, NULL, 0, NULL, 1, &barrierPresent);
 
             cmdEndGpuFrameProfile(graphicsCmd, gGraphicsProfileToken);
             endCmd(graphicsCmd);
@@ -2551,9 +2528,9 @@ public:
             perFrameParams[13].mIndex = SRT_RES_IDX(SrtData, PerFrame, gPrevFrameTex);
             perFrameParams[13].ppTextures = &pResolveVRSRenderTarget[1 - i]->pTexture;
             perFrameParams[14].mIndex = SRT_RES_IDX(SrtData, PerFrame, gPrevHistoryTex);
-            perFrameParams[14].ppTextures = &pHistoryRenderTarget[i]->pTexture;
+            perFrameParams[14].ppTextures = &pHistoryRenderTarget[1 - i]->pTexture;
             perFrameParams[15].mIndex = SRT_RES_IDX(SrtData, PerFrame, gHistoryTex);
-            perFrameParams[15].ppTextures = &pHistoryRenderTarget[1 - i]->pTexture;
+            perFrameParams[15].ppTextures = &pHistoryRenderTarget[i]->pTexture;
             perFrameParams[16].mIndex = SRT_RES_IDX(SrtData, PerFrame, gMsaaSource);
             perFrameParams[16].ppTextures = &pRenderTargetMSAA->pTexture;
             perFrameParams[17].mIndex = SRT_RES_IDX(SrtData, PerFrame, gHistoryTexVBShade);
@@ -2663,8 +2640,8 @@ public:
 
     void addOrderIndependentTransparencyResources()
     {
-        const uint32_t width = gSceneWidth;
-        const uint32_t height = gSceneHeight;
+        const uint32_t width = gSceneRes.mWidth;
+        const uint32_t height = gSceneRes.mHeight;
 
         const uint32_t maxNodeCountOIT = OIT_MAX_FRAG_COUNT * width * height;
 
@@ -2719,8 +2696,8 @@ public:
         swapChainDesc.mWindowHandle = pWindow->handle;
         swapChainDesc.mPresentQueueCount = 1;
         swapChainDesc.ppPresentQueues = &pGraphicsQueue;
-        swapChainDesc.mWidth = gSceneWidth;
-        swapChainDesc.mHeight = gSceneHeight;
+        swapChainDesc.mWidth = mSettings.mWidth;
+        swapChainDesc.mHeight = mSettings.mHeight;
         swapChainDesc.mImageCount = getRecommendedSwapchainImageCount(pRenderer, &pWindow->handle);
         swapChainDesc.mColorFormat = getSupportedSwapchainFormat(pRenderer, &swapChainDesc, COLOR_SPACE_SDR_SRGB);
         swapChainDesc.mColorSpace = COLOR_SPACE_SDR_SRGB;
@@ -2757,8 +2734,8 @@ public:
 
     void addRenderTargets()
     {
-        const uint32_t width = gSceneWidth;
-        const uint32_t height = gSceneHeight;
+        const uint32_t width = gSceneRes.mWidth;
+        const uint32_t height = gSceneRes.mHeight;
 
         /************************************************************************/
         /************************************************************************/
@@ -2766,10 +2743,36 @@ public:
         ClearValue optimizedColorClearBlack = { { 0.0f, 0.0f, 0.0f, 0.0f } };
         ClearValue optimizedColorClearWhite = { { 1.0f, 1.0f, 1.0f, 1.0f } };
 
+        uint32_t currentOffsetESRAM = 0;
+
+        /************************************************************************/
+        // Shadow pass render target
+        /************************************************************************/
+        ESRAM_BEGIN_ALLOC(pRenderer, "Shadow Maps", currentOffsetESRAM);
+        RenderTargetDesc shadowRTDesc = {};
+        shadowRTDesc.mArraySize = 1;
+        shadowRTDesc.mClearValue = optimizedDepthClear;
+        shadowRTDesc.mDepth = 1;
+        shadowRTDesc.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+        shadowRTDesc.mFormat = TinyImageFormat_D32_SFLOAT;
+        shadowRTDesc.mStartState = RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        shadowRTDesc.mWidth = gShadowMapSize;
+        shadowRTDesc.mSampleCount = SAMPLE_COUNT_1;
+        shadowRTDesc.mSampleQuality = 0;
+        shadowRTDesc.mFlags = TEXTURE_CREATION_FLAG_ESRAM;
+        shadowRTDesc.mHeight = gShadowMapSize;
+        shadowRTDesc.pName = "Shadow Map RT";
+        addRenderTarget(pRenderer, &shadowRTDesc, &pRenderTargetShadow);
+        ESRAM_CURRENT_OFFSET(pRenderer, shadowMapOffsetESRAM);
+        ESRAM_END_ALLOC(pRenderer);
+
+        currentOffsetESRAM = max(shadowMapOffsetESRAM, currentOffsetESRAM);
+
         /************************************************************************/
         // Main depth buffer
         /************************************************************************/
         // Add depth buffer
+        ESRAM_BEGIN_ALLOC(pRenderer, "Depth Buffer", currentOffsetESRAM);
         RenderTargetDesc depthRT = {};
         depthRT.mArraySize = 1;
         depthRT.mClearValue.depth = 0.0f; // optimizedDepthClear;
@@ -2784,48 +2787,17 @@ public:
         depthRT.mWidth = width / gDivider;
         depthRT.pName = "Depth Buffer RT";
         depthRT.mFlags = TEXTURE_CREATION_FLAG_SAMPLE_LOCATIONS_COMPATIBLE;
+        depthRT.mFlags |= TEXTURE_CREATION_FLAG_ESRAM;
         addRenderTarget(pRenderer, &depthRT, &pDepthBuffer);
+        ESRAM_CURRENT_OFFSET(pRenderer, depthOffsetESRAM);
+        ESRAM_END_ALLOC(pRenderer);
 
-        // Add OIT dummy depth buffer
-        RenderTargetDesc oitDepthRT = {};
-        oitDepthRT.mArraySize = 1;
-        oitDepthRT.mClearValue = optimizedDepthClear;
-        oitDepthRT.mDepth = 1;
-        oitDepthRT.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
-        oitDepthRT.mFormat = TinyImageFormat_D32_SFLOAT;
-        oitDepthRT.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
-        oitDepthRT.mHeight = height;
-        oitDepthRT.mSampleCount = SAMPLE_COUNT_1;
-        oitDepthRT.mSampleQuality = 0;
-        oitDepthRT.mFlags = TEXTURE_CREATION_FLAG_NONE;
-        oitDepthRT.mWidth = width;
-        oitDepthRT.pName = "Depth Buffer OIT RT";
-        addRenderTarget(pRenderer, &oitDepthRT, &pDepthBufferOIT);
+        currentOffsetESRAM = max(depthOffsetESRAM, currentOffsetESRAM);
 
-        /************************************************************************/
-        // Shadow pass render target
-        /************************************************************************/
-        RenderTargetDesc shadowRTDesc = {};
-        shadowRTDesc.mArraySize = 1;
-        shadowRTDesc.mClearValue = optimizedDepthClear;
-        shadowRTDesc.mDepth = 1;
-        shadowRTDesc.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
-        shadowRTDesc.mFormat = TinyImageFormat_D32_SFLOAT;
-        shadowRTDesc.mStartState = RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        shadowRTDesc.mWidth = gShadowMapSize;
-        shadowRTDesc.mSampleCount = SAMPLE_COUNT_1;
-        shadowRTDesc.mSampleQuality = 0;
-        // shadowRTDesc.mFlags = TEXTURE_CREATION_FLAG_ESRAM;
-        shadowRTDesc.mHeight = gShadowMapSize;
-        shadowRTDesc.pName = "Shadow Map RT";
-        addRenderTarget(pRenderer, &shadowRTDesc, &pRenderTargetShadow);
-
-        const uint32_t depthAllocationOffset = ESRAM_CURRENT_OFFSET(pRenderer);
-        UNREF_PARAM(depthAllocationOffset);
         /************************************************************************/
         // Visibility buffer pass render target
         /************************************************************************/
-        ESRAM_BEGIN_ALLOC(pRenderer, "VB RT", depthAllocationOffset);
+        ESRAM_BEGIN_ALLOC(pRenderer, "VB RT", currentOffsetESRAM);
         RenderTargetDesc vbRTDesc = {};
         vbRTDesc.mArraySize = 1;
         vbRTDesc.mClearValue = optimizedColorClearWhite;
@@ -2840,28 +2812,35 @@ public:
         vbRTDesc.mWidth = width / gDivider;
         vbRTDesc.pName = "VB RT";
         addRenderTarget(pRenderer, &vbRTDesc, &pRenderTargetVBPass);
+        ESRAM_CURRENT_OFFSET(pRenderer, vbOffsetESRAM);
         ESRAM_END_ALLOC(pRenderer);
-        /************************************************************************/
-        // MSAA render target
-        /************************************************************************/
-        RenderTargetDesc msaaRTDesc = {};
-        msaaRTDesc.mArraySize = 1;
-        msaaRTDesc.mClearValue = optimizedColorClearBlack;
-        msaaRTDesc.mDepth = 1;
-        msaaRTDesc.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
-        msaaRTDesc.mFormat = pSwapChain->mFormat;
-        msaaRTDesc.mStartState = RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        msaaRTDesc.mHeight = height / gDivider;
-        msaaRTDesc.mSampleCount = gAppSettings.mMsaaLevel;
-        msaaRTDesc.mSampleQuality = 0;
-        msaaRTDesc.mWidth = width / gDivider;
-        msaaRTDesc.pName = "MSAA RT";
-        addRenderTarget(pRenderer, &msaaRTDesc, &pRenderTargetMSAA);
+
+        currentOffsetESRAM = max(vbOffsetESRAM, currentOffsetESRAM);
+
+        ESRAM_BEGIN_ALLOC(pRenderer, "OIT Depth", currentOffsetESRAM);
+        // Add OIT dummy depth buffer
+        RenderTargetDesc oitDepthRT = {};
+        oitDepthRT.mArraySize = 1;
+        oitDepthRT.mClearValue = optimizedDepthClear;
+        oitDepthRT.mDepth = 1;
+        oitDepthRT.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+        oitDepthRT.mFormat = TinyImageFormat_D32_SFLOAT;
+        oitDepthRT.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+        oitDepthRT.mHeight = height;
+        oitDepthRT.mSampleCount = SAMPLE_COUNT_1;
+        oitDepthRT.mSampleQuality = 0;
+        oitDepthRT.mFlags = TEXTURE_CREATION_FLAG_NONE;
+        oitDepthRT.mFlags |= TEXTURE_CREATION_FLAG_ESRAM;
+        oitDepthRT.mWidth = width;
+        oitDepthRT.pName = "Depth Buffer OIT RT";
+        addRenderTarget(pRenderer, &oitDepthRT, &pDepthBufferOIT);
+        ESRAM_CURRENT_OFFSET(pRenderer, oitOffsetESRAM);
+        ESRAM_END_ALLOC(pRenderer);
 
         /************************************************************************/
         // Intermediate render target
         /************************************************************************/
-        ESRAM_BEGIN_ALLOC(pRenderer, "Intermediate", depthAllocationOffset);
+        ESRAM_BEGIN_ALLOC(pRenderer, "Intermediate", currentOffsetESRAM);
         RenderTargetDesc postProcRTDesc = {};
         postProcRTDesc.mArraySize = 1;
         postProcRTDesc.mClearValue = { { 0.0f, 0.0f, 0.0f, 0.0f } };
@@ -2876,31 +2855,32 @@ public:
         postProcRTDesc.mFlags = TEXTURE_CREATION_FLAG_ESRAM;
         postProcRTDesc.pName = "pIntermediateRenderTarget";
         addRenderTarget(pRenderer, &postProcRTDesc, &pIntermediateRenderTarget);
+        ESRAM_CURRENT_OFFSET(pRenderer, intermediateOffsetESRAM);
         ESRAM_END_ALLOC(pRenderer);
 
         /************************************************************************/
-        // GodRay render target
+        // MSAA render target
         /************************************************************************/
-        TinyImageFormat  GRRTFormat = pRenderer->pGpu->mFormatCaps[TinyImageFormat_B10G11R11_UFLOAT] & (FORMAT_CAP_READ_WRITE)
-                                          ? TinyImageFormat_B10G11R11_UFLOAT
-                                          : TinyImageFormat_R8G8B8A8_UNORM;
-        RenderTargetDesc GRRTDesc = {};
-        GRRTDesc.mArraySize = 1;
-        GRRTDesc.mClearValue = { { 0.0f, 0.0f, 0.0f, 1.0f } };
-        GRRTDesc.mDepth = 1;
-        GRRTDesc.mStartState = RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        GRRTDesc.mHeight = height / gGodrayScale;
-        GRRTDesc.mWidth = width / gGodrayScale;
-        GRRTDesc.mFormat = GRRTFormat;
-        GRRTDesc.mDescriptors = DESCRIPTOR_TYPE_RW_TEXTURE | DESCRIPTOR_TYPE_TEXTURE;
-        GRRTDesc.mSampleCount = pSwapChain->ppRenderTargets[0]->mSampleCount;
-        GRRTDesc.mSampleQuality = pSwapChain->ppRenderTargets[0]->mSampleQuality;
+        ESRAM_BEGIN_ALLOC(pRenderer, "MSAA RT", currentOffsetESRAM);
+        RenderTargetDesc msaaRTDesc = {};
+        msaaRTDesc.mArraySize = 1;
+        msaaRTDesc.mClearValue = optimizedColorClearBlack;
+        msaaRTDesc.mDepth = 1;
+        msaaRTDesc.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+        msaaRTDesc.mFormat = pSwapChain->mFormat;
+        msaaRTDesc.mStartState = RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        msaaRTDesc.mHeight = height / gDivider;
+        msaaRTDesc.mSampleCount = gAppSettings.mMsaaLevel;
+        msaaRTDesc.mSampleQuality = 0;
+        msaaRTDesc.mWidth = width / gDivider;
+        msaaRTDesc.pName = "MSAA RT";
+        msaaRTDesc.mFlags = TEXTURE_CREATION_FLAG_ESRAM;
+        addRenderTarget(pRenderer, &msaaRTDesc, &pRenderTargetMSAA);
+        ESRAM_CURRENT_OFFSET(pRenderer, msaaOffsetESRAM);
+        ESRAM_END_ALLOC(pRenderer);
 
-        GRRTDesc.pName = "GodRay RT A";
-        addRenderTarget(pRenderer, &GRRTDesc, &pRenderTargetGodRay[0]);
-        GRRTDesc.pName = "GodRay RT B";
-        GRRTDesc.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
-        addRenderTarget(pRenderer, &GRRTDesc, &pRenderTargetGodRay[1]);
+        currentOffsetESRAM = max(msaaOffsetESRAM, max(intermediateOffsetESRAM, max(oitOffsetESRAM, currentOffsetESRAM)));
+
         /************************************************************************/
         // VRS History render targets
         /************************************************************************/
@@ -2943,6 +2923,30 @@ public:
         resolveVRSRTDesc.pName = "VRS Debug RT";
         resolveVRSRTDesc.mFormat = TinyImageFormat_R8G8B8A8_UNORM;
         addRenderTarget(pRenderer, &resolveVRSRTDesc, &pDebugVRSRenderTarget);
+
+        /************************************************************************/
+        // GodRay render target
+        /************************************************************************/
+        TinyImageFormat  GRRTFormat = pRenderer->pGpu->mFormatCaps[TinyImageFormat_B10G11R11_UFLOAT] & (FORMAT_CAP_READ_WRITE)
+                                          ? TinyImageFormat_B10G11R11_UFLOAT
+                                          : TinyImageFormat_R8G8B8A8_UNORM;
+        RenderTargetDesc GRRTDesc = {};
+        GRRTDesc.mArraySize = 1;
+        GRRTDesc.mClearValue = { { 0.0f, 0.0f, 0.0f, 1.0f } };
+        GRRTDesc.mDepth = 1;
+        GRRTDesc.mStartState = RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        GRRTDesc.mHeight = height / gGodrayScale;
+        GRRTDesc.mWidth = width / gGodrayScale;
+        GRRTDesc.mFormat = GRRTFormat;
+        GRRTDesc.mDescriptors = DESCRIPTOR_TYPE_RW_TEXTURE | DESCRIPTOR_TYPE_TEXTURE;
+        GRRTDesc.mSampleCount = pSwapChain->ppRenderTargets[0]->mSampleCount;
+        GRRTDesc.mSampleQuality = pSwapChain->ppRenderTargets[0]->mSampleQuality;
+        GRRTDesc.pName = "GodRay RT A";
+        addRenderTarget(pRenderer, &GRRTDesc, &pRenderTargetGodRay[0]);
+        GRRTDesc.pName = "GodRay RT B";
+        GRRTDesc.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
+        addRenderTarget(pRenderer, &GRRTDesc, &pRenderTargetGodRay[1]);
+
         /************************************************************************/
         /************************************************************************/
     }
@@ -3091,8 +3095,8 @@ public:
         presentShaderDesc.mFrag.pFileName = "display.frag";
 
         ShaderLoadDesc skyboxTriShaderDesc = {};
-        skyboxTriShaderDesc.mVert.pFileName = "skybox_tri.vert";
-        skyboxTriShaderDesc.mFrag.pFileName = "skybox_tri.frag";
+        skyboxTriShaderDesc.mVert.pFileName = "Skybox.vert";
+        skyboxTriShaderDesc.mFrag.pFileName = "Skybox.frag";
 
         ShaderLoadDesc fillStencilDesc = {};
         fillStencilDesc.mVert.pFileName = "fillStencil.vert";
@@ -3412,7 +3416,7 @@ public:
             initExtendedGraphicsShaderLimits(&edescs[0].shaderLimitsDesc);
             edescs[0].shaderLimitsDesc.maxWavesWithLateAllocParameterCache = 16;
 
-            edescs[1].type = EXTENDED_GRAPHICS_PIPELINE_TYPE_DEPTH_STENCIL_OPTIONS;
+            edescs[1].type = EXTENDED_GRAPHICS_PIPELINE_TYPE_PIXEL_SHADER_OPTIONS;
             edescs[1].pixelShaderOptions.outOfOrderRasterization = PIXEL_SHADER_OPTION_OUT_OF_ORDER_RASTERIZATION_ENABLE_WATER_MARK_7;
             edescs[1].pixelShaderOptions.depthBeforeShader =
                 !i ? PIXEL_SHADER_OPTION_DEPTH_BEFORE_SHADER_ENABLE : PIXEL_SHADER_OPTION_DEPTH_BEFORE_SHADER_DEFAULT;
@@ -3462,7 +3466,7 @@ public:
             initExtendedGraphicsShaderLimits(&edescs[0].shaderLimitsDesc);
             // edescs[0].ShaderLimitsDesc.MaxWavesWithLateAllocParameterCache = 22;
 
-            edescs[1].type = EXTENDED_GRAPHICS_PIPELINE_TYPE_DEPTH_STENCIL_OPTIONS;
+            edescs[1].type = EXTENDED_GRAPHICS_PIPELINE_TYPE_PIXEL_SHADER_OPTIONS;
             edescs[1].pixelShaderOptions.outOfOrderRasterization = PIXEL_SHADER_OPTION_OUT_OF_ORDER_RASTERIZATION_ENABLE_WATER_MARK_7;
             edescs[1].pixelShaderOptions.depthBeforeShader =
                 !i ? PIXEL_SHADER_OPTION_DEPTH_BEFORE_SHADER_ENABLE : PIXEL_SHADER_OPTION_DEPTH_BEFORE_SHADER_DEFAULT;
@@ -3863,14 +3867,14 @@ public:
     // This includes transform matrices, render target resolution and global information about the scene.
     void updateUniformData(uint currentFrameIdx)
     {
-        const uint32_t width = gSceneWidth;
-        const uint32_t height = gSceneHeight;
+        const uint32_t width = gSceneRes.mWidth;
+        const uint32_t height = gSceneRes.mHeight;
         const float    aspectRatioInv = (float)height / width;
         const uint32_t frameIdx = currentFrameIdx;
         PerFrameData*  currentFrame = &gPerFrame[frameIdx];
 
         mat4         cameraModel = mat4::scale(vec3(SCENE_SCALE));
-        mat4         cameraView = pCameraController->getViewMatrix();
+        CameraMatrix cameraView = pCameraController->getViewMatrix();
         CameraMatrix cameraProj =
             CameraMatrix::perspectiveReverseZ(PI / 2.0f, aspectRatioInv, gAppSettings.nearPlane, gAppSettings.farPlane);
 
@@ -3924,8 +3928,11 @@ public:
         currentFrame->gPerFrameUniformData.transform[VIEW_CAMERA].invVP =
             CameraMatrix::inverse(currentFrame->gPerFrameUniformData.transform[VIEW_CAMERA].vp);
         currentFrame->gPerFrameUniformData.transform[VIEW_CAMERA].projection = cameraProj;
+        currentFrame->gPerFrameUniformData.transform[VIEW_CAMERA].prevMVP = currentFrame->gPerFrameUniformData.transform[VIEW_CAMERA].mvp;
         currentFrame->gPerFrameUniformData.transform[VIEW_CAMERA].mvp =
             currentFrame->gPerFrameUniformData.transform[VIEW_CAMERA].vp * cameraModel;
+        currentFrame->gPerFrameUniformData.transform[VIEW_CAMERA].invMVP =
+            CameraMatrix::inverse(currentFrame->gPerFrameUniformData.transform[VIEW_CAMERA].mvp);
         /************************************************************************/
         // Culling data
         /************************************************************************/
@@ -3938,7 +3945,7 @@ public:
         // Cache eye position in object space for cluster culling on the CPU
         currentFrame->gEyeObjectSpace[VIEW_SHADOW] = (inverse(lightView * lightModel) * vec4(0, 0, 0, 1)).getXYZ();
         currentFrame->gEyeObjectSpace[VIEW_CAMERA] =
-            (inverse(cameraView * cameraModel) * vec4(0, 0, 0, 1)).getXYZ(); // vec4(0,0,0,1) is the camera position in eye space
+            (inverse(cameraView.mCamera * cameraModel) * vec4(0, 0, 0, 1)).getXYZ(); // vec4(0,0,0,1) is the camera position in eye space
         /************************************************************************/
         // Shading data
         /************************************************************************/
@@ -3949,8 +3956,8 @@ public:
         /************************************************************************/
         cameraView.setTranslation(vec3(0));
         currentFrame->gUniformDataSky.mCamPos = pCameraController->getViewPosition();
-        currentFrame->gUniformDataSky.mProjectView = cameraProj.mCamera * cameraView;
-        currentFrame->gUniformDataSkyTri.mInverseViewProjection = inverse(cameraProj.mCamera * cameraView);
+        currentFrame->gUniformDataSky.mProjectView = cameraProj.mCamera * cameraView.mCamera;
+        currentFrame->gUniformDataSkyTri.mInverseViewProjection = inverse(cameraProj.mCamera * cameraView.mCamera);
         /************************************************************************/
         // Tonemap
         /************************************************************************/
@@ -3997,7 +4004,9 @@ public:
                 const uint32_t meshDataIdx = gSceneMeshCount + gStaticMeshInstanceCount + i;
 
                 MeshData* meshData = &currentFrame->pMeshData[meshDataIdx];
+                meshData->prevModelMtx = meshData->modelMtx;
                 meshData->modelMtx = mat4::translation(am->mTranslation) * mat4::rotation(am->mRotation) * mat4::scale(am->mScale);
+                meshData->invModelMtx = inverse(meshData->modelMtx);
                 meshData->preSkinnedVertexOffset = preSkinnedVertexStartOffsetInUnifiedBuffer + am->mPreSkinnedVertexOffset;
             }
         }
@@ -4061,8 +4070,9 @@ public:
         // Generate the shading rate image
         RenderTargetBarrier barriers[] = {
             { pHistoryRenderTarget[frameIdx], RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET },
+            { pRenderTargetVBPass, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_PIXEL_SHADER_RESOURCE },
         };
-        cmdResourceBarrier(cmd, 0, NULL, 0, NULL, 1, barriers);
+        cmdResourceBarrier(cmd, 0, NULL, 0, NULL, 2, barriers);
 
         cmdBeginGpuTimestampQuery(cmd, pGpuProfiler, "VRS Filling Pass");
         BindRenderTargetsDesc bindRenderTargets = {};
@@ -4076,7 +4086,6 @@ public:
 
         cmdBindPipeline(cmd, pPipelineFillStencil);
         cmdBindDescriptorSet(cmd, frameIdx, pDescriptorSetPerFrame);
-        cmdBindDescriptorSet(cmd, 1 - frameIdx, pDescriptorSetPerFrame);
 
         cmdSetStencilReferenceValue(cmd, 1);
         cmdDraw(cmd, 3, 0);
@@ -4086,8 +4095,9 @@ public:
         cmdBindRenderTargets(cmd, NULL);
 
         barriers[0] = { pHistoryRenderTarget[frameIdx], RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE };
+        barriers[1] = { pRenderTargetVBPass, RESOURCE_STATE_PIXEL_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET },
 
-        cmdResourceBarrier(cmd, 0, NULL, 0, NULL, 1, barriers);
+        cmdResourceBarrier(cmd, 0, NULL, 0, NULL, 2, barriers);
     }
 
     // Render the scene to perform the Visibility Buffer pass. In this pass the (filtered) scene geometry is rendered
@@ -4435,9 +4445,6 @@ public:
         cmdDraw(cmd, 3, 0);
         cmdBindRenderTargets(cmd, NULL);
 
-        RenderTargetBarrier barrierPresent = { pDstCol, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_PRESENT };
-        cmdResourceBarrier(cmd, 0, NULL, 0, NULL, 1, &barrierPresent);
-
         cmdEndGpuTimestampQuery(cmd, gGraphicsProfileToken);
     }
 
@@ -4446,12 +4453,13 @@ public:
     {
         UNREF_PARAM(frameIdx);
 
+        RenderTarget*         rt = pSwapChain->ppRenderTargets[frameIdx];
         BindRenderTargetsDesc bindRenderTargets = {};
         bindRenderTargets.mRenderTargetCount = 1;
-        bindRenderTargets.mRenderTargets[0] = { pScreenRenderTarget, LOAD_ACTION_LOAD };
+        bindRenderTargets.mRenderTargets[0] = { rt, LOAD_ACTION_LOAD };
         cmdBindRenderTargets(cmd, &bindRenderTargets);
-        cmdSetViewport(cmd, 0.0f, 0.0f, (float)pScreenRenderTarget->mWidth, (float)pScreenRenderTarget->mHeight, 0.0f, 1.0f);
-        cmdSetScissor(cmd, 0, 0, pScreenRenderTarget->mWidth, pScreenRenderTarget->mHeight);
+        cmdSetViewport(cmd, 0.0f, 0.0f, (float)rt->mWidth, (float)rt->mHeight, 0.0f, 1.0f);
+        cmdSetScissor(cmd, 0, 0, rt->mWidth, rt->mHeight);
 
         gFrameTimeDraw.mFontColor = 0xff00ffff;
         gFrameTimeDraw.mFontSize = 18.0f;

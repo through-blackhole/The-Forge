@@ -40,6 +40,9 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#ifndef __cplusplus
+#include <stdbool.h>
+#endif
 
 //////////////////////////////////////////////
 //// Compiler setup
@@ -266,6 +269,8 @@ COMPILE_ASSERT(sizeof(ssize_t) == sizeof(int64_t));
 #define ORBIS
 #elif defined(__PROSPERO__)
 #define PROSPERO
+#elif defined(__linux__)
+#define STEAMDECK
 #endif
 
 #ifndef MIN_MALLOC_ALIGNMENT
@@ -416,3 +421,5 @@ COMPILE_ASSERT(sizeof(ssize_t) == sizeof(int64_t));
 // #error "_DEBUG and NDEBUG are defined at the same time"
 #endif
 #endif
+
+#define VR_API_OPENXR

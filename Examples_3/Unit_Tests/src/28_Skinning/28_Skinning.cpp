@@ -67,7 +67,7 @@
 
 // fsl
 #include "../../../../Common_3/Graphics/FSL/defaults.h"
-#include "./Shaders/FSL/srt.h"
+#include "./Shaders/FSL/Global.srt.h"
 
 //--------------------------------------------------------------------------------------------
 // RENDERING PIPELINE DATA
@@ -292,7 +292,7 @@ public:
         // check for init success
         if (!pRenderer)
         {
-            ShowUnsupportedMessage("Failed To Initialize renderer!");
+            ShowUnsupportedMessage(getUnsupportedGPUMsg());
             return false;
         }
         setupGPUConfigurationPlatformParameters(pRenderer, settings.pExtendedSettings);
@@ -822,7 +822,7 @@ public:
         /************************************************************************/
 
         // update camera with time
-        mat4 viewMat = pCameraController->getViewMatrix();
+        CameraMatrix viewMat = pCameraController->getViewMatrix();
 
         const float  aspectInverse = (float)mSettings.mHeight / (float)mSettings.mWidth;
         const float  horizontal_fov = PI / 2.0f;
@@ -856,7 +856,7 @@ public:
         getHiresTimerUSec(&gAnimationUpdateTimer, true);
 
         // Update uniforms that will be shared between all skeletons
-        gSkeletonBatcher.SetSharedUniforms(projViewMat, viewMat, lightPos, lightColor);
+        gSkeletonBatcher.SetSharedUniforms(projViewMat, viewMat.mCamera, lightPos, lightColor);
 
         for (uint i = 0; i < pGeomData->mJointCount; ++i)
         {
@@ -1234,6 +1234,8 @@ public:
     bool addDepthBuffer()
     {
         // Add depth buffer
+        ESRAM_BEGIN_ALLOC(pRenderer, "Depth", 0);
+
         RenderTargetDesc depthRT = {};
         depthRT.mArraySize = 1;
         depthRT.mClearValue.depth = 0.0f;
@@ -1245,8 +1247,10 @@ public:
         depthRT.mSampleCount = SAMPLE_COUNT_1;
         depthRT.mSampleQuality = 0;
         depthRT.mWidth = mSettings.mWidth;
-        depthRT.mFlags = TEXTURE_CREATION_FLAG_ON_TILE | TEXTURE_CREATION_FLAG_VR_MULTIVIEW;
+        depthRT.mFlags = TEXTURE_CREATION_FLAG_ESRAM | TEXTURE_CREATION_FLAG_ON_TILE | TEXTURE_CREATION_FLAG_VR_MULTIVIEW;
         addRenderTarget(pRenderer, &depthRT, &pDepthBuffer);
+
+        ESRAM_END_ALLOC(pRenderer);
 
         return pDepthBuffer != NULL;
     }

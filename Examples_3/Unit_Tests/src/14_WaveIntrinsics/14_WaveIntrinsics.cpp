@@ -49,7 +49,7 @@
 
 // fsl
 #include "../../../../Common_3/Graphics/FSL/defaults.h"
-#include "./Shaders/FSL/srt.h"
+#include "./Shaders/FSL/Global.srt.h"
 
 /// Demo structures
 struct SceneConstantBuffer
@@ -159,24 +159,10 @@ public:
         // check for init success
         if (!pRenderer)
         {
-            ShowUnsupportedMessage("Failed To Initialize renderer!");
+            ShowUnsupportedMessage(getUnsupportedGPUMsg());
             return false;
         }
         setupGPUConfigurationPlatformParameters(pRenderer, settings.pExtendedSettings);
-
-        const bool waveOpsSupported = (pRenderer->pGpu->mWaveOpsSupportFlags & WAVE_OPS_SUPPORT_FLAG_BASIC_BIT);
-        if (!waveOpsSupported)
-        {
-            ShowUnsupportedMessage("GPU does not support wave ops");
-            return false;
-        }
-
-        const bool waveOpsStageSupported = (pRenderer->pGpu->mWaveOpsSupportedStageFlags & SHADER_STAGE_FRAG);
-        if (!waveOpsStageSupported)
-        {
-            ShowUnsupportedMessage("GPU does not support wave ops on fragment stage");
-            return false;
-        }
 
         QueueDesc queueDesc = {};
         queueDesc.mType = QUEUE_TYPE_GRAPHICS;
@@ -778,7 +764,8 @@ public:
 
     bool addIntermediateRenderTarget()
     {
-        // Add depth buffer
+        ESRAM_BEGIN_ALLOC(pRenderer, "Intermediate", 0);
+
         RenderTargetDesc rtDesc = {};
         rtDesc.mArraySize = 1;
         rtDesc.mClearValue = {
@@ -792,8 +779,10 @@ public:
         rtDesc.mSampleCount = SAMPLE_COUNT_1;
         rtDesc.mSampleQuality = 0;
         rtDesc.mWidth = mSettings.mWidth;
-        rtDesc.mFlags = TEXTURE_CREATION_FLAG_VR_MULTIVIEW;
+        rtDesc.mFlags = TEXTURE_CREATION_FLAG_ESRAM | TEXTURE_CREATION_FLAG_VR_MULTIVIEW;
         addRenderTarget(pRenderer, &rtDesc, &pRenderTargetIntermediate);
+
+        ESRAM_END_ALLOC(pRenderer);
 
         return pRenderTargetIntermediate != NULL;
     }
