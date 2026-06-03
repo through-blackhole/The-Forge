@@ -96,6 +96,8 @@ public:
 
     virtual const char* GetName() = 0;
 
+    virtual void InitResourceDirectories() {}
+
     struct Settings
     {
         /// Window width

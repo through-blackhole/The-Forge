@@ -357,8 +357,11 @@ int WindowsMain(int argc, char** argv, IApp* app)
 
     FileSystemInitDesc fsDesc = {};
     fsDesc.pAppName = app->GetName();
+    fsDesc.mIsTool = true;
     if (!initFileSystem(&fsDesc))
         return EXIT_FAILURE;
+
+    app->InitResourceDirectories();
 
 #if defined(ENABLE_GRAPHICS_VALIDATION) && defined(VULKAN) && VK_OVERRIDE_LAYER_PATH
     // We are now shipping validation layer in the repo itself to remove dependency on Vulkan SDK to be installed

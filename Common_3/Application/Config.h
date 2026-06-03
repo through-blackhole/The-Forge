@@ -302,14 +302,14 @@ COMPILE_ASSERT(sizeof(ssize_t) == sizeof(int64_t));
 //// General options
 //////////////////////////////////////////////
 // #define ENABLE_MATH_CHECKS // Enables low level math library debug checks like SIMD variable alignment checks
-#define ENABLE_FORGE_SCRIPTING
-#define ENABLE_FORGE_RELOAD_SHADER
-#define ENABLE_FORGE_UI
+// #define ENABLE_FORGE_SCRIPTING
+// #define ENABLE_FORGE_RELOAD_SHADER
+// #define ENABLE_FORGE_UI
 #define ENABLE_FORGE_FONTS
 #define ENABLE_FORGE_INPUT
-#define ENABLE_FORGE_ANIMATION_DEBUG
+// #define ENABLE_FORGE_ANIMATION_DEBUG
 // #define ENABLE_FORGE_GPU_ANIMATION_DEBUG
-#define ENABLE_FORGE_MATERIALS
+// #define ENABLE_FORGE_MATERIALS
 #define ENABLE_ZIP_FILESYSTEM
 #define ENABLE_SCREENSHOT
 #define ENABLE_PROFILER
@@ -319,7 +319,7 @@ COMPILE_ASSERT(sizeof(ssize_t) == sizeof(int64_t));
 
 // ENABLE_FORGE_ANDROID_SHADERC can be disabled if all shaders are compiled offline.
 // This way we also avoid to link to this library
-#define ENABLE_FORGE_ANDROID_SHADERC
+// #define ENABLE_FORGE_ANDROID_SHADERC
 
 #if TARGET_OS_IPHONE || (defined(MAC_OS_VERSION_11_0) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_VERSION_11_0)
 // needed for GC haptics. Because we have to link CoreHaptics libs
